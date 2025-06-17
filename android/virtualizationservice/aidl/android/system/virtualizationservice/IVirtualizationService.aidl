@@ -58,6 +58,13 @@ interface IVirtualizationService {
             in ParcelFileDescriptor imageFd, long sizeBytes, PartitionType type);
 
     /**
+     * Set the encrypted storage size.
+     *
+     * The file must be open with both read and write permissions.
+     */
+    void setEncryptedStorageSize(in ParcelFileDescriptor imageFd, long size);
+
+    /**
      * Create or update an idsig file that digests the given APK file. The idsig file follows the
      * idsig format that is defined by the APK Signature Scheme V4. The idsig file is not updated
      * when it is up to date with the input file, which is checked by comparing the
@@ -81,6 +88,11 @@ interface IVirtualizationService {
      * Get a list of supported OSes.
      */
     String[] getSupportedOSList();
+
+    /**
+     * Get installed debug policy for test and debugging purpose.
+     */
+    String getDebugPolicy();
 
     /** Returns whether given feature is enabled. */
     boolean isFeatureEnabled(in String feature);

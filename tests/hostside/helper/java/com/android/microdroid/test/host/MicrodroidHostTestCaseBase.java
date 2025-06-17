@@ -18,6 +18,7 @@ package com.android.microdroid.test.host;
 
 import static com.android.tradefed.testtype.DeviceJUnit4ClassRunner.TestLogData;
 
+import static com.google.common.truth.Truth.assertThat;
 import static com.google.common.truth.Truth.assertWithMessage;
 
 import static org.junit.Assume.assumeFalse;
@@ -229,8 +230,12 @@ public abstract class MicrodroidHostTestCaseBase extends BaseHostJUnit4Test {
 
     public boolean isFeatureEnabled(String feature) throws Exception {
         CommandRunner android = new CommandRunner(getDevice());
-        String result = android.run(VIRT_APEX + "bin/vm", "check-feature-enabled", feature);
-        return result.contains("enabled");
+        String cmd = VIRT_APEX + "bin/vm check-feature-enabled " + feature;
+        CommandResult result = android.runForResult(cmd);
+        assumeTrue(
+                "Failed to run" + cmd + " " + result,
+                result.getStatus() == CommandStatus.SUCCESS && result.getExitCode() == 0);
+        return result.getStdout().trim().contains("Feature " + feature + " is enabled");
     }
 
     public List<AssignableDevice> getAssignableDevices() throws Exception {
@@ -261,10 +266,38 @@ public abstract class MicrodroidHostTestCaseBase extends BaseHostJUnit4Test {
     }
 
     public List<String> getSupportedOSList() throws Exception {
+        // The --os flag was introduced in SDK level 36. When running tests on earlier dessert
+        // releases only use "microdroid" OS.
+        if (getAndroidDevice().getApiLevel() < 36) {
+            return Arrays.asList("microdroid");
+        }
         return parseStringArrayFieldsFromVmInfo("Available OS list: ");
     }
 
     protected boolean isPkvmHypervisor() throws DeviceNotAvailableException {
         return "kvm.arm-protected".equals(getDevice().getProperty("ro.boot.hypervisor.version"));
+    }
+
+    protected TestDevice getAndroidDevice() {
+        TestDevice androidDevice = (TestDevice) getDevice();
+        assertThat(androidDevice).isNotNull();
+        return androidDevice;
+    }
+
+    protected void assumeKernelSupported(String osKey) throws Exception {
+        String os = SUPPORTED_OSES.get(osKey);
+        assumeTrue(
+                "Skipping test as OS \"" + os + "\" is not supported",
+                getSupportedOSList().contains(os));
+    }
+
+    protected void assumeVmTypeSupported(String os, boolean protectedVm) throws Exception {
+        // TODO(b/376870129): remove this check
+        if (protectedVm) {
+            assumeFalse("pVMs with 16k kernel are not supported yet :(", os.endsWith("_16k"));
+        }
+        assumeTrue(
+                "Microdroid is not supported for specific VM protection type",
+                getAndroidDevice().supportsMicrodroid(protectedVm));
     }
 }

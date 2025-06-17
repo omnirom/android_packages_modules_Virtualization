@@ -15,8 +15,10 @@
  */
 package android.system.virtualizationservice;
 
+import android.system.virtualizationservice.AssignedDevices;
 import android.system.virtualizationservice.AudioConfig;
-import android.system.virtualizationservice.CpuTopology;
+import android.system.virtualizationservice.CpuOptions;
+import android.system.virtualizationservice.CustomMemoryBackingFile;
 import android.system.virtualizationservice.DiskImage;
 import android.system.virtualizationservice.DisplayConfig;
 import android.system.virtualizationservice.GpuConfig;
@@ -29,7 +31,11 @@ parcelable VirtualMachineRawConfig {
     /** Name of VM */
     String name;
 
-    /** Id of the VM instance */
+    /**
+     * Id of the VM instance
+     *
+     * See AVirtualMachineRawConfig_setInstanceId for details.
+     */
     byte[64] instanceId;
 
     /** The kernel image, if any. */
@@ -62,8 +68,11 @@ parcelable VirtualMachineRawConfig {
     /** The amount of RAM to give the VM, in MiB. 0 or negative to use the default. */
     int memoryMib;
 
-    /** The vCPU topology that will be generated for the VM. Default to 1 vCPU. */
-    CpuTopology cpuTopology = CpuTopology.ONE_CPU;
+    /** The amount of swiotlb to give the VM, in MiB. 0 or negative to use the default. */
+    int swiotlbMib;
+
+    /** The vCPU options that will be generated for the VM. */
+    CpuOptions cpuOptions;
 
     /**
      * A version or range of versions of the virtual platform that this config is compatible with.
@@ -85,8 +94,8 @@ parcelable VirtualMachineRawConfig {
      */
     boolean hugePages;
 
-    /** List of SysFS nodes of devices to be assigned */
-    String[] devices;
+    /** Assigned devices */
+    AssignedDevices devices;
 
     @nullable DisplayConfig displayConfig;
 
@@ -106,11 +115,20 @@ parcelable VirtualMachineRawConfig {
 
     @nullable AudioConfig audioConfig;
 
-    boolean noBalloon;
+    boolean balloon;
 
     /** Enable or disable USB passthrough support */
     @nullable UsbConfig usbConfig;
 
     /** List of tee services this VM wants to access */
     String[] teeServices;
+
+    /**
+     * Set whether to use an alternate, hypervisor-specific authentication method for protected
+     * VMs.
+     */
+    boolean enableHypervisorSpecificAuthMethod;
+
+    /** Custom memfds for a subset of guest memory */
+    CustomMemoryBackingFile[] customMemoryBackingFiles;
 }

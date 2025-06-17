@@ -22,11 +22,11 @@ use binder::{Strong};
 use coset::{CoseKey, CborSerializable, CborOrdering};
 use dice_policy_builder::{TargetEntry, ConstraintSpec, ConstraintType, policy_for_dice_chain, MissingAction, WILDCARD_FULL_ARRAY};
 use diced_open_dice::{DiceArtifacts, OwnedDiceArtifacts};
+use explicitkeydice::OwnedDiceArtifactsWithExplicitKey;
 use keystore2_crypto::ZVec;
 use openssl::hkdf::hkdf;
 use openssl::md::Md;
 use openssl::sha;
-use secretkeeper_client::dice::OwnedDiceArtifactsWithExplicitKey;
 use secretkeeper_client::SkSession;
 use secretkeeper_comm::data_types::{Id, ID_SIZE, Secret, SECRET_SIZE};
 use secretkeeper_comm::data_types::response::Response;
@@ -35,7 +35,13 @@ use secretkeeper_comm::data_types::request_response_impl::{
     StoreSecretRequest, GetSecretResponse, GetSecretRequest};
 use secretkeeper_comm::data_types::error::SecretkeeperError;
 use std::fs;
+use std::thread;
+use rand::Rng;
+use std::time::Duration;
 use zeroize::Zeroizing;
+use std::sync::Mutex;
+use std::sync::Arc;
+use crate::VmInstanceState;
 
 const ENCRYPTEDSTORE_KEY_IDENTIFIER: &str = "encryptedstore_key";
 const AUTHORITY_HASH: i64 = -4670549;
@@ -60,6 +66,8 @@ const SALT_PAYLOAD_SERVICE: &[u8] = &[
     0x55, 0xF8, 0x08, 0x23, 0x81, 0x5F, 0xF5, 0x16, 0x20, 0x3E, 0xBE, 0xBA, 0xB7, 0xA8, 0x43, 0x92,
 ];
 
+const BACKOFF_SK_ACCESS_MS: u64 = 100;
+
 pub enum VmSecret {
     // V2 secrets are derived from 2 independently secured secrets:
     //      1. Secretkeeper protected secrets (skp secret).
@@ -69,13 +77,21 @@ pub enum VmSecret {
     // with downgraded images will not have access to VM's secret.
     // V2 secrets require hardware support - Secretkeeper HAL, which (among other things)
     // is backed by tamper-evident storage, providing rollback protection to these secrets.
-    V2 { dice_artifacts: OwnedDiceArtifactsWithExplicitKey, skp_secret: ZVec },
+    V2 {
+        instance_id: [u8; ID_SIZE],
+        dice_artifacts: OwnedDiceArtifactsWithExplicitKey,
+        skp_secret: ZVec,
+        secretkeeper_session: SkVmSession,
+        virtual_machine_service: Strong<dyn IVirtualMachineService>,
+    },
     // V1 secrets are not protected against rollback of boot images.
     // They are reliable only if rollback of images was prevented by verified boot ie,
     // each stage (including pvmfw/Microdroid/Microdroid Manager) prevents downgrade of next
     // stage. These are now legacy secrets & used only when Secretkeeper HAL is not supported
     // by device.
-    V1 { dice_artifacts: OwnedDiceArtifacts },
+    V1 {
+        dice_artifacts: OwnedDiceArtifacts,
+    },
 }
 
 // For supporting V2 secrets, guest expects the public key to be present in the Linux device tree.
@@ -90,6 +106,7 @@ impl VmSecret {
     pub fn new(
         dice_artifacts: OwnedDiceArtifacts,
         vm_service: &Strong<dyn IVirtualMachineService>,
+        state: &mut VmInstanceState,
     ) -> Result<Self> {
         ensure!(dice_artifacts.bcc().is_some(), "Dice chain missing");
         if !crate::should_defer_rollback_protection() {
@@ -98,31 +115,33 @@ impl VmSecret {
 
         let explicit_dice = OwnedDiceArtifactsWithExplicitKey::from_owned_artifacts(dice_artifacts)
             .context("Failed to get Dice artifacts in explicit key format")?;
-        // For pVM, skp_secret are stored in Secretkeeper. For non-protected it is all 0s.
+        let id = super::get_instance_id()?.ok_or(anyhow!("Missing instance_id"))?;
+        let explicit_dice_chain = explicit_dice
+            .explicit_key_dice_chain()
+            .ok_or(anyhow!("Missing explicit dice chain, this is unusual"))?;
+        let policy = sealing_policy(explicit_dice_chain)
+            .map_err(|e| anyhow!("Failed to build a sealing_policy: {e}"))?;
+        let session = SkVmSession::new(vm_service, &explicit_dice, policy)?;
         let mut skp_secret = Zeroizing::new([0u8; SECRET_SIZE]);
-        if super::is_strict_boot() {
-            let sk_service = get_secretkeeper_service(vm_service)?;
-            let mut session =
-                SkSession::new(sk_service, &explicit_dice, Some(get_secretkeeper_identity()?))?;
-            let id = super::get_instance_id()?.ok_or(anyhow!("Missing instance_id"))?;
-            let explicit_dice_chain = explicit_dice
-                .explicit_key_dice_chain()
-                .ok_or(anyhow!("Missing explicit dice chain, this is unusual"))?;
-            let policy = sealing_policy(explicit_dice_chain)
-                .map_err(|e| anyhow!("Failed to build a sealing_policy: {e}"))?;
-            if let Some(secret) = get_secret(&mut session, id, Some(policy.clone()))? {
-                *skp_secret = secret;
-            } else {
-                log::warn!(
-                    "No entry found in Secretkeeper for this VM instance, creating new secret."
-                );
-                *skp_secret = rand::random();
-                store_secret(&mut session, id, skp_secret.clone(), policy)?;
-            }
-        }
+        get_or_create_sk_secret(&session, id, &mut skp_secret, state).or_else(|e| {
+            // TODO(b/399304956): Secretkeeper rejects requests when overloaded with
+            // connections from multiple clients. Backoff & retry again, hoping it is
+            // less busy then. Secretkeeper changes are required for more robust solutions.
+            log::info!(
+                "get_or_create_sk_secret failed with {e:?}. Refreshing connection & retrying!"
+            );
+            let mut rng = rand::thread_rng();
+            let backoff = rng.gen_range(BACKOFF_SK_ACCESS_MS..2 * BACKOFF_SK_ACCESS_MS);
+            thread::sleep(Duration::from_millis(backoff));
+            session.refresh()?;
+            get_or_create_sk_secret(&session, id, &mut skp_secret, state)
+        })?;
         Ok(Self::V2 {
+            instance_id: id,
             dice_artifacts: explicit_dice,
             skp_secret: ZVec::try_from(skp_secret.to_vec())?,
+            secretkeeper_session: session,
+            virtual_machine_service: vm_service.clone(),
         })
     }
 
@@ -135,7 +154,7 @@ impl VmSecret {
 
     fn get_vm_secret(&self, salt: &[u8], identifier: &[u8], key: &mut [u8]) -> Result<()> {
         match self {
-            Self::V2 { dice_artifacts, skp_secret } => {
+            Self::V2 { dice_artifacts, skp_secret, .. } => {
                 let mut hasher = sha::Sha256::new();
                 hasher.update(dice_artifacts.cdi_seal());
                 hasher.update(skp_secret);
@@ -156,6 +175,42 @@ impl VmSecret {
     /// Derive encryptedstore key. This uses hardcoded random salt & fixed identifier.
     pub fn derive_encryptedstore_key(&self, key: &mut [u8]) -> Result<()> {
         self.get_vm_secret(SALT_ENCRYPTED_STORE, ENCRYPTEDSTORE_KEY_IDENTIFIER.as_bytes(), key)
+    }
+
+    pub fn read_payload_data_rp(&self) -> Result<Option<[u8; SECRET_SIZE]>> {
+        let Self::V2 { instance_id, secretkeeper_session, .. } = self else {
+            return Err(anyhow!("Rollback protected data is not available with V1 secrets"));
+        };
+        let payload_id = sha::sha512(instance_id);
+        secretkeeper_session.get_secret(payload_id).or_else(|e| {
+            log::info!("Secretkeeper get failed with {e:?}. Refreshing connection & retrying!");
+            secretkeeper_session.refresh()?;
+            secretkeeper_session.get_secret(payload_id)
+        })
+    }
+
+    pub fn write_payload_data_rp(&self, data: &[u8; SECRET_SIZE]) -> Result<()> {
+        let data = Zeroizing::new(*data);
+        let Self::V2 { instance_id, secretkeeper_session, virtual_machine_service, .. } = self
+        else {
+            return Err(anyhow!("Rollback protected data is not available with V1 secrets"));
+        };
+        let payload_id = sha::sha512(instance_id);
+        // Claim the Secretkeeper entry - this pings AVF host to account this Secretkeeper entry
+        // correctly.
+        virtual_machine_service.claimSecretkeeperEntry(&payload_id).map_err(|e| {
+            // TODO rename this error!
+            super::MicrodroidError::FailedToConnectToVirtualizationService(format!(
+                "Failed to claim Secretkeeper entry: {e:?}"
+            ))
+        })?;
+
+        if let Err(e) = secretkeeper_session.store_secret(payload_id, data.clone()) {
+            log::info!("Secretkeeper store failed with {e:?}. Refreshing connection & retrying!");
+            secretkeeper_session.refresh()?;
+            secretkeeper_session.store_secret(payload_id, data)?;
+        }
+        Ok(())
     }
 }
 
@@ -231,48 +286,73 @@ fn sealing_policy(dice: &[u8]) -> Result<Vec<u8>, String> {
         .map_err(|e| format!("DicePolicy construction failed {e:?}"))
 }
 
-fn store_secret(
-    session: &mut SkSession,
-    id: [u8; ID_SIZE],
-    secret: Zeroizing<[u8; SECRET_SIZE]>,
+// The secure session between VM & Secretkeeper
+pub(crate) struct SkVmSession {
+    session: Arc<Mutex<SkSession>>,
     sealing_policy: Vec<u8>,
-) -> Result<()> {
-    let store_request = StoreSecretRequest { id: Id(id), secret: Secret(*secret), sealing_policy };
-    log::info!("Secretkeeper operation: {:?}", store_request);
-
-    let store_request = store_request.serialize_to_packet().to_vec().map_err(anyhow_err)?;
-    let store_response = session.secret_management_request(&store_request)?;
-    let store_response = ResponsePacket::from_slice(&store_response).map_err(anyhow_err)?;
-    let response_type = store_response.response_type().map_err(anyhow_err)?;
-    ensure!(
-        response_type == ResponseType::Success,
-        "Secretkeeper store failed with error: {:?}",
-        *SecretkeeperError::deserialize_from_packet(store_response).map_err(anyhow_err)?
-    );
-    Ok(())
 }
 
-fn get_secret(
-    session: &mut SkSession,
-    id: [u8; ID_SIZE],
-    updated_sealing_policy: Option<Vec<u8>>,
-) -> Result<Option<[u8; SECRET_SIZE]>> {
-    let get_request = GetSecretRequest { id: Id(id), updated_sealing_policy };
-    log::info!("Secretkeeper operation: {:?}", get_request);
-    let get_request = get_request.serialize_to_packet().to_vec().map_err(anyhow_err)?;
-    let get_response = session.secret_management_request(&get_request)?;
-    let get_response = ResponsePacket::from_slice(&get_response).map_err(anyhow_err)?;
-    let response_type = get_response.response_type().map_err(anyhow_err)?;
-    if response_type == ResponseType::Success {
-        let get_response =
-            *GetSecretResponse::deserialize_from_packet(get_response).map_err(anyhow_err)?;
-        Ok(Some(get_response.secret.0))
-    } else {
-        let error = SecretkeeperError::deserialize_from_packet(get_response).map_err(anyhow_err)?;
-        if *error == SecretkeeperError::EntryNotFound {
-            return Ok(None);
+impl SkVmSession {
+    fn new(
+        vm_service: &Strong<dyn IVirtualMachineService>,
+        dice: &OwnedDiceArtifactsWithExplicitKey,
+        sealing_policy: Vec<u8>,
+    ) -> Result<Self> {
+        let secretkeeper_proxy = get_secretkeeper_service(vm_service)?;
+        let session = SkSession::new(secretkeeper_proxy, dice, Some(get_secretkeeper_identity()?))?;
+        let session = Arc::new(Mutex::new(session));
+        Ok(Self { session, sealing_policy })
+    }
+
+    fn refresh(&self) -> Result<()> {
+        let mut session = self.session.lock().unwrap();
+        Ok(session.refresh()?)
+    }
+
+    fn store_secret(&self, id: [u8; ID_SIZE], secret: Zeroizing<[u8; SECRET_SIZE]>) -> Result<()> {
+        let store_request = StoreSecretRequest {
+            id: Id(id),
+            secret: Secret(*secret),
+            sealing_policy: self.sealing_policy.clone(),
+        };
+        log::info!("Secretkeeper operation: {:?}", store_request);
+
+        let store_request = store_request.serialize_to_packet().to_vec().map_err(anyhow_err)?;
+        let session = &mut *self.session.lock().unwrap();
+        let store_response = session.secret_management_request(&store_request)?;
+        let store_response = ResponsePacket::from_slice(&store_response).map_err(anyhow_err)?;
+        let response_type = store_response.response_type().map_err(anyhow_err)?;
+        ensure!(
+            response_type == ResponseType::Success,
+            "Secretkeeper store failed with error: {:?}",
+            *SecretkeeperError::deserialize_from_packet(store_response).map_err(anyhow_err)?
+        );
+        Ok(())
+    }
+
+    fn get_secret(&self, id: [u8; ID_SIZE]) -> Result<Option<[u8; SECRET_SIZE]>> {
+        let get_request = GetSecretRequest {
+            id: Id(id),
+            updated_sealing_policy: Some(self.sealing_policy.clone()),
+        };
+        log::info!("Secretkeeper operation: {:?}", get_request);
+        let get_request = get_request.serialize_to_packet().to_vec().map_err(anyhow_err)?;
+        let session = &mut *self.session.lock().unwrap();
+        let get_response = session.secret_management_request(&get_request)?;
+        let get_response = ResponsePacket::from_slice(&get_response).map_err(anyhow_err)?;
+        let response_type = get_response.response_type().map_err(anyhow_err)?;
+        if response_type == ResponseType::Success {
+            let get_response =
+                *GetSecretResponse::deserialize_from_packet(get_response).map_err(anyhow_err)?;
+            Ok(Some(get_response.secret.0))
+        } else {
+            let error =
+                SecretkeeperError::deserialize_from_packet(get_response).map_err(anyhow_err)?;
+            if *error == SecretkeeperError::EntryNotFound {
+                return Ok(None);
+            }
+            Err(anyhow!("Secretkeeper get failed: {error:?}"))
         }
-        Err(anyhow!("Secretkeeper get failed: {error:?}"))
     }
 }
 
@@ -292,4 +372,22 @@ fn get_secretkeeper_service(
                 "Failed to get Secretkeeper: {e:?}"
             ))
         })?)
+}
+
+fn get_or_create_sk_secret(
+    session: &SkVmSession,
+    id: [u8; ID_SIZE],
+    skp_secret: &mut Zeroizing<[u8; SECRET_SIZE]>,
+    state: &mut VmInstanceState,
+) -> Result<()> {
+    if let Some(secret) = session.get_secret(id)? {
+        **skp_secret = secret;
+        *state = VmInstanceState::PreviouslySeen;
+    } else {
+        log::warn!("No entry found in Secretkeeper for this VM instance, creating new secret.");
+        **skp_secret = rand::random();
+        session.store_secret(id, skp_secret.clone())?;
+        *state = VmInstanceState::NewlyCreated;
+    }
+    Ok(())
 }

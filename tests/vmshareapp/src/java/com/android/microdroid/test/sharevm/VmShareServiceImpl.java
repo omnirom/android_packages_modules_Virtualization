@@ -223,6 +223,11 @@ public class VmShareServiceImpl extends Service {
         }
 
         @Override
+        public long getEncryptedStorageSize() throws RemoteException {
+            throw new UnsupportedOperationException("Not supported");
+        }
+
+        @Override
         public void runEchoReverseServer() throws RemoteException {
             throw new UnsupportedOperationException("Not supported");
         }
@@ -274,6 +279,26 @@ public class VmShareServiceImpl extends Service {
 
         @Override
         public void quit() throws RemoteException {
+            throw new UnsupportedOperationException("Not supported");
+        }
+
+        @Override
+        public byte[] insecurelyReadPayloadRpData() {
+            throw new UnsupportedOperationException("Not supported");
+        }
+
+        @Override
+        public void insecurelyWritePayloadRpData(byte[] data) {
+            throw new UnsupportedOperationException("Not supported");
+        }
+
+        @Override
+        public boolean isNewInstance() {
+            throw new UnsupportedOperationException("Not supported");
+        }
+
+        @Override
+        public void checkLibIcuIsAccessible() {
             throw new UnsupportedOperationException("Not supported");
         }
     }

@@ -15,13 +15,14 @@
 //! Struct for VM configuration with JSON (de)serialization and AIDL parcelables
 
 use android_system_virtualizationservice::{
-    aidl::android::system::virtualizationservice::CpuTopology::CpuTopology,
-    aidl::android::system::virtualizationservice::DiskImage::DiskImage as AidlDiskImage,
-    aidl::android::system::virtualizationservice::Partition::Partition as AidlPartition,
-    aidl::android::system::virtualizationservice::UsbConfig::UsbConfig as AidlUsbConfig,
-    aidl::android::system::virtualizationservice::VirtualMachineAppConfig::DebugLevel::DebugLevel,
-    aidl::android::system::virtualizationservice::VirtualMachineConfig::VirtualMachineConfig,
-    aidl::android::system::virtualizationservice::VirtualMachineRawConfig::VirtualMachineRawConfig,
+    aidl::android::system::virtualizationservice::{
+        AssignedDevices::AssignedDevices, CpuOptions::CpuOptions,
+        CpuOptions::CpuTopology::CpuTopology, DiskImage::DiskImage as AidlDiskImage,
+        Partition::Partition as AidlPartition, UsbConfig::UsbConfig as AidlUsbConfig,
+        VirtualMachineAppConfig::DebugLevel::DebugLevel,
+        VirtualMachineConfig::VirtualMachineConfig,
+        VirtualMachineRawConfig::VirtualMachineRawConfig,
+    },
     binder::ParcelFileDescriptor,
 };
 
@@ -108,11 +109,12 @@ impl VmConfig {
             0
         };
         let cpu_topology = match self.cpu_topology.as_deref() {
-            None => CpuTopology::ONE_CPU,
-            Some("one_cpu") => CpuTopology::ONE_CPU,
-            Some("match_host") => CpuTopology::MATCH_HOST,
+            None => CpuTopology::CpuCount(1),
+            Some("one_cpu") => CpuTopology::CpuCount(1),
+            Some("match_host") => CpuTopology::MatchHost(true),
             Some(cpu_topology) => bail!("Invalid cpu topology {}", cpu_topology),
         };
+        let cpu_options = CpuOptions { cpuTopology: cpu_topology };
         let usb_config = self.usb_config.clone().map(|x| x.to_parcelable()).transpose()?;
         Ok(VirtualMachineRawConfig {
             kernel: maybe_open_parcel_file(&self.kernel, false)?,
@@ -122,17 +124,21 @@ impl VmConfig {
             disks: self.disks.iter().map(DiskImage::to_parcelable).collect::<Result<_, Error>>()?,
             protectedVm: self.protected,
             memoryMib: memory_mib,
-            cpuTopology: cpu_topology,
+            cpuOptions: cpu_options,
             platformVersion: self.platform_version.to_string(),
-            devices: self
-                .devices
-                .iter()
-                .map(|x| {
-                    x.to_str().map(String::from).ok_or(anyhow!("Failed to convert {x:?} to String"))
-                })
-                .collect::<Result<_>>()?,
+            devices: AssignedDevices::Devices(
+                self.devices
+                    .iter()
+                    .map(|x| {
+                        x.to_str()
+                            .map(String::from)
+                            .ok_or(anyhow!("Failed to convert {x:?} to String"))
+                    })
+                    .collect::<Result<_>>()?,
+            ),
             consoleInputDevice: self.console_input_device.clone(),
             usbConfig: usb_config,
+            balloon: true,
             ..Default::default()
         })
     }

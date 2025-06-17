@@ -21,7 +21,7 @@ use anyhow::{anyhow, bail, Context, Error, Result};
 use binder::ParcelFileDescriptor;
 use command_fds::CommandFdExt;
 use libc::{sysconf, _SC_CLK_TCK};
-use log::{debug, error, info};
+use log::{debug, error, info, warn};
 use semver::{Version, VersionReq};
 use nix::{fcntl::OFlag, unistd::pipe2, unistd::Uid, unistd::User};
 use regex::{Captures, Regex};
@@ -47,6 +47,8 @@ use android_system_virtualizationcommon::aidl::android::system::virtualizationco
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
     VirtualMachineAppConfig::DebugLevel::DebugLevel,
     AudioConfig::AudioConfig as AudioConfigParcelable,
+    CpuOptions::CpuOptions,
+    CpuOptions::CpuTopology::CpuTopology,
     DisplayConfig::DisplayConfig as DisplayConfigParcelable,
     GpuConfig::GpuConfig as GpuConfigParcelable,
     UsbConfig::UsbConfig as UsbConfigParcelable,
@@ -112,8 +114,8 @@ pub struct CrosvmConfig {
     pub protected: bool,
     pub debug_config: DebugConfig,
     pub memory_mib: NonZeroU32,
-    pub cpus: Option<NonZeroU32>,
-    pub host_cpu_topology: bool,
+    pub swiotlb_mib: Option<NonZeroU32>,
+    pub cpus: CpuOptions,
     pub console_out_fd: Option<File>,
     pub console_in_fd: Option<File>,
     pub log_fd: Option<File>,
@@ -124,7 +126,7 @@ pub struct CrosvmConfig {
     pub gdb_port: Option<NonZeroU16>,
     pub vfio_devices: Vec<VfioDevice>,
     pub dtbo: Option<File>,
-    pub device_tree_overlay: Option<File>,
+    pub device_tree_overlays: Vec<File>,
     pub display_config: Option<DisplayConfig>,
     pub input_device_options: Vec<InputDeviceOption>,
     pub hugepages: bool,
@@ -133,9 +135,14 @@ pub struct CrosvmConfig {
     pub boost_uclamp: bool,
     pub gpu_config: Option<GpuConfig>,
     pub audio_config: Option<AudioConfig>,
-    pub no_balloon: bool,
+    pub balloon: bool,
     pub usb_config: UsbConfig,
     pub dump_dt_fd: Option<File>,
+    pub enable_hypervisor_specific_auth_method: bool,
+    pub instance_id: [u8; 64],
+    // (memfd, guest address, size)
+    pub custom_memory_backing_files: Vec<(OwnedFd, u64, u64)>,
+    pub start_suspended: bool,
 }
 
 #[derive(Debug)]
@@ -321,7 +328,7 @@ impl VmState {
             let tap =
                 if let Some(tap_file) = &config.tap { Some(tap_file.try_clone()?) } else { None };
 
-            run_virtiofs(&config)?;
+            let vhost_fs_devices = run_virtiofs(&config)?;
 
             // If this fails and returns an error, `self` will be left in the `Failed` state.
             let child =
@@ -336,7 +343,13 @@ impl VmState {
             let child_clone = child.clone();
             let instance_clone = instance.clone();
             let monitor_vm_exit_thread = Some(thread::spawn(move || {
-                instance_clone.monitor_vm_exit(child_clone, failure_pipe_read, vfio_devices, tap);
+                instance_clone.monitor_vm_exit(
+                    child_clone,
+                    failure_pipe_read,
+                    vfio_devices,
+                    tap,
+                    vhost_fs_devices,
+                );
             }));
 
             if detect_hangup {
@@ -405,6 +418,10 @@ pub struct VmInstance {
     pub vm_service: Mutex<Option<Strong<dyn IVirtualMachineService>>>,
     /// Recorded metrics of VM such as timestamp or cpu / memory usage.
     pub vm_metric: Mutex<VmMetric>,
+    // Whether virtio-balloon is enabled
+    pub balloon_enabled: bool,
+    /// List of vendor tee services this VM might access.
+    pub vendor_tee_services: Vec<String>,
     /// The latest lifecycle state which the payload reported itself to be in.
     payload_state: Mutex<PayloadState>,
     /// Represents the condition that payload_state was updated
@@ -432,11 +449,13 @@ impl VmInstance {
         requester_uid: u32,
         requester_debug_pid: i32,
         vm_context: VmContext,
+        vendor_tee_services: Vec<String>,
     ) -> Result<VmInstance, Error> {
         validate_config(&config)?;
         let cid = config.cid;
         let name = config.name.clone();
         let protected = config.protected;
+        let balloon_enabled = config.balloon;
         let requester_uid_name = User::from_uid(Uid::from_raw(requester_uid))
             .ok()
             .flatten()
@@ -457,6 +476,8 @@ impl VmInstance {
             payload_state: Mutex::new(PayloadState::Starting),
             payload_state_updated: Condvar::new(),
             requester_uid_name,
+            balloon_enabled,
+            vendor_tee_services,
         };
         info!("{} created", &instance);
         Ok(instance)
@@ -483,6 +504,7 @@ impl VmInstance {
         failure_pipe_read: File,
         vfio_devices: Vec<VfioDevice>,
         tap: Option<File>,
+        vhost_user_devices: Vec<SharedChild>,
     ) {
         let failure_reason_thread = std::thread::spawn(move || {
             // Read the pipe to see if any failure reason is written
@@ -506,6 +528,34 @@ impl VmInstance {
                     if exit_status_code == CROSVM_WATCHDOG_REBOOT_STATUS {
                         info!("detected vcpu stall on crosvm");
                     }
+                }
+            }
+        }
+
+        // In crosvm, when vhost_user frontend is dead, vhost_user backend device will detect and
+        // exit. We can safely wait() for vhost user device after waiting crosvm main
+        // process.
+        for device in vhost_user_devices {
+            match device.wait() {
+                Ok(status) => {
+                    info!("Vhost user device({}) exited with status {}", device.id(), status);
+                    if !status.success() {
+                        if let Some(code) = status.code() {
+                            // vhost_user backend device exit with error code
+                            error!(
+                                "vhost user device({}) exited with error code: {}",
+                                device.id(),
+                                code
+                            );
+                        } else {
+                            // The spawned child process of vhost_user backend device is
+                            // killed by signal
+                            error!("vhost user device({}) killed by signal", device.id());
+                        }
+                    }
+                }
+                Err(e) => {
+                    error!("Error waiting for vhost user device({}) to die: {}", device.id(), e);
                 }
             }
         }
@@ -587,6 +637,7 @@ impl VmInstance {
 
     fn monitor_vm_status(&self, child: Arc<SharedChild>) {
         let pid = child.id();
+        let mut metric_countdown = 0;
 
         loop {
             {
@@ -596,28 +647,43 @@ impl VmInstance {
                     break;
                 }
 
-                let mut vm_metric = self.vm_metric.lock().unwrap();
+                if metric_countdown > 0 {
+                    metric_countdown -= 1;
+                } else {
+                    metric_countdown = 10;
+                    let mut vm_metric = self.vm_metric.lock().unwrap();
 
-                // Get CPU Information
-                match get_guest_time(pid) {
-                    Ok(guest_time) => vm_metric.cpu_guest_time = Some(guest_time),
-                    Err(e) => error!("Failed to get guest CPU time: {e:?}"),
-                }
-
-                // Get Memory Information
-                match get_rss(pid) {
-                    Ok(rss) => {
-                        vm_metric.rss = match &vm_metric.rss {
-                            Some(x) => Some(Rss::extract_max(x, &rss)),
-                            None => Some(rss),
+                    // Get CPU Information
+                    match get_guest_time(pid) {
+                        Ok(guest_time) => vm_metric.cpu_guest_time = Some(guest_time),
+                        Err(e) => {
+                            metric_countdown = 0;
+                            warn!("Failed to get guest CPU time: {}", e);
                         }
                     }
-                    Err(e) => error!("Failed to get guest RSS: {}", e),
+
+                    // Get Memory Information
+                    match get_rss(pid) {
+                        Ok(rss) => {
+                            vm_metric.rss = match &vm_metric.rss {
+                                Some(x) => Some(Rss::extract_max(x, &rss)),
+                                None => Some(rss),
+                            }
+                        }
+                        Err(e) => {
+                            metric_countdown = 0;
+                            warn!("Failed to get guest RSS: {}", e);
+                        }
+                    }
                 }
             }
 
             thread::sleep(Duration::from_secs(1));
         }
+    }
+
+    fn is_vm_running(&self) -> bool {
+        matches!(&*self.vm_state.lock().unwrap(), VmState::Running { .. })
     }
 
     /// Returns the last reported state of the VM payload.
@@ -669,6 +735,12 @@ impl VmInstance {
 
     /// Returns current virtio-balloon size.
     pub fn get_memory_balloon(&self) -> Result<u64, Error> {
+        if !self.is_vm_running() {
+            bail!("get_memory_balloon when VM is not running");
+        }
+        if !self.balloon_enabled {
+            bail!("virtio-balloon is not enabled");
+        }
         let socket_path_cstring = path_to_cstring(&self.crosvm_control_socket_path);
         let mut balloon_actual = 0u64;
         // SAFETY: Pointers are valid for the lifetime of the call. Null `stats` is valid.
@@ -688,6 +760,12 @@ impl VmInstance {
     /// Inflates the virtio-balloon by `num_bytes` to reclaim guest memory. Called in response to
     /// memory-trimming notifications.
     pub fn set_memory_balloon(&self, num_bytes: u64) -> Result<(), Error> {
+        if !self.is_vm_running() {
+            bail!("set_memory_balloon when VM is not running");
+        }
+        if !self.balloon_enabled {
+            bail!("virtio-balloon is not enabled");
+        }
         let socket_path_cstring = path_to_cstring(&self.crosvm_control_socket_path);
         // SAFETY: Pointer is valid for the lifetime of the call.
         let success = unsafe {
@@ -753,6 +831,18 @@ impl VmInstance {
         }
         Ok(())
     }
+
+    /// Performs full resume of VM.
+    pub fn resume_full(&self) -> Result<(), Error> {
+        let socket_path_cstring = path_to_cstring(&self.crosvm_control_socket_path);
+        // SAFETY: Pointer is valid for the lifetime of the call.
+        let success =
+            unsafe { crosvm_control::crosvm_client_resume_vm_full(socket_path_cstring.as_ptr()) };
+        if !success {
+            bail!("Failed to resume VM");
+        }
+        Ok(())
+    }
 }
 
 impl Rss {
@@ -804,6 +894,9 @@ fn get_guest_time(pid: u32) -> Result<i64> {
     }
 
     let guest_time_ticks = data_list[42].parse::<i64>()?;
+    if guest_time_ticks == 0 {
+        bail!("zero value is measured on elapsed CPU guest_time");
+    }
     // SAFETY: It just returns an integer about CPU tick information.
     let ticks_per_sec = unsafe { sysconf(_SC_CLK_TCK) };
     Ok(guest_time_ticks * MILLIS_PER_SEC / ticks_per_sec)
@@ -834,7 +927,12 @@ fn get_rss(pid: u32) -> Result<Rss> {
             rss_crosvm_total += rss;
         }
     }
-
+    if rss_crosvm_total == 0 {
+        bail!("zero value is measured on RSS of crosvm");
+    }
+    if rss_vm_total == 0 {
+        bail!("zero value is measured on RSS of VM");
+    }
     Ok(Rss { vm: rss_vm_total, crosvm: rss_crosvm_total })
 }
 
@@ -912,7 +1010,8 @@ fn vfio_argument_for_platform_device(device: &VfioDevice) -> Result<String, Erro
     }
 }
 
-fn run_virtiofs(config: &CrosvmConfig) -> io::Result<()> {
+fn run_virtiofs(config: &CrosvmConfig) -> io::Result<Vec<SharedChild>> {
+    let mut devices: Vec<SharedChild> = Vec::new();
     for shared_path in &config.shared_paths {
         if shared_path.app_domain {
             continue;
@@ -944,9 +1043,10 @@ fn run_virtiofs(config: &CrosvmConfig) -> io::Result<()> {
 
         let result = SharedChild::spawn(&mut command)?;
         info!("Spawned virtiofs crosvm({})", result.id());
+        devices.push(result);
     }
 
-    Ok(())
+    Ok(devices)
 }
 
 /// Starts an instance of `crosvm` to manage a new VM.
@@ -975,9 +1075,7 @@ fn run_vm(
         .arg("--cid")
         .arg(config.cid.to_string());
 
-    if system_properties::read_bool("hypervisor.memory_reclaim.supported", false)?
-        && !config.no_balloon
-    {
+    if config.balloon {
         command.arg("--balloon-page-reporting");
     } else {
         command.arg("--no-balloon");
@@ -989,7 +1087,29 @@ fn run_vm(
 
     let mut memory_mib = config.memory_mib;
 
+    if config.enable_hypervisor_specific_auth_method && !config.protected {
+        bail!("hypervisor specific auth method only supported for protected VMs");
+    }
     if config.protected {
+        if config.enable_hypervisor_specific_auth_method {
+            if !hypervisor_props::is_gunyah()? {
+                bail!("hypervisor specific auth method not supported for current hypervisor");
+            }
+            // "QCOM Trusted VM" compatibility mode.
+            //
+            // When this mode is enabled, two hypervisor specific IDs are expected to be packed
+            // into the instance ID. We extract them here and pass along to crosvm so they can be
+            // given to the hypervisor driver via an ioctl.
+            let pas_id = u32::from_le_bytes(config.instance_id[60..64].try_into().unwrap());
+            let vm_id = u16::from_le_bytes(config.instance_id[58..60].try_into().unwrap());
+            command.arg("--hypervisor").arg(
+                format!("gunyah[device=/dev/gunyah,qcom_trusted_vm_id={vm_id},qcom_trusted_vm_pas_id={pas_id}]"),
+            );
+            // Put the FDT close to the payload (default is end of RAM) to so that CMA can be used
+            // without bloating memory usage.
+            command.arg("--fdt-position").arg("after-payload");
+        }
+
         match system_properties::read(SYSPROP_CUSTOM_PVMFW_PATH)? {
             Some(pvmfw_path) if !pvmfw_path.is_empty() => {
                 if pvmfw_path == "none" {
@@ -1001,11 +1121,18 @@ fn run_vm(
             _ => command.arg("--protected-vm"),
         };
 
-        // 3 virtio-console devices + vsock = 4.
-        let virtio_pci_device_count = 4 + config.disks.len();
-        // crosvm virtio queue has 256 entries, so 2 MiB per device (2 pages per entry) should be
-        // enough.
-        let swiotlb_size_mib = 2 * virtio_pci_device_count as u32;
+        let swiotlb_size_mib = config.swiotlb_mib.map(u32::from).unwrap_or({
+            // 3 virtio-console devices + vsock = 4.
+            // TODO: Count more device types, like balloon, input, and sound.
+            let virtio_pci_device_count = 4 + config.disks.len();
+            // crosvm virtio queue has 256 entries, so 2 MiB per device (2 pages per entry) should
+            // be enough.
+            // NOTE: The above explanation isn't completely accurate, e.g., circa 2024q4, each
+            // virtio-block has 16 queues with 256 entries each and each virito-console has 2
+            // queues of 256 entries each. So, it is allocating less than 2 pages per entry, but
+            // seems to work well enough in practice.
+            2 * virtio_pci_device_count as u32
+        });
         command.arg("--swiotlb").arg(swiotlb_size_mib.to_string());
 
         // b/346770542 for consistent "usable" memory across protected and non-protected VMs.
@@ -1037,26 +1164,35 @@ fn run_vm(
     #[cfg(target_arch = "aarch64")]
     command
         .arg("--pci")
-        .arg("mem=[start=0x70000000,size=0x2000000],cam=[start=0x72000000,size=0x1000000]");
+        .arg("mem=[start=0x2c000000,size=0x2000000],cam=[start=0x2e000000,size=0x1000000]");
 
     command.arg("--mem").arg(memory_mib.to_string());
 
-    if let Some(cpus) = config.cpus {
-        command.arg("--cpus").arg(cpus.to_string());
+    fn cpu_arg_command(command: &mut Command, count: usize) {
+        #[cfg(target_arch = "aarch64")]
+        command.arg("--cpus").arg(count.to_string() + ",sve=[auto=true]");
+        #[cfg(not(target_arch = "aarch64"))]
+        command.arg("--cpus").arg(count.to_string());
     }
-
-    if config.host_cpu_topology {
-        if cfg!(virt_cpufreq) && check_if_all_cpus_allowed()? {
-            command.arg("--host-cpu-topology");
-            cfg_if::cfg_if! {
-                if #[cfg(any(target_arch = "aarch64"))] {
+    match config.cpus.cpuTopology {
+        CpuTopology::MatchHost(_) => {
+            if cfg!(virt_cpufreq) && check_if_all_cpus_allowed()? {
+                command.arg("--host-cpu-topology");
+                #[cfg(target_arch = "aarch64")]
+                {
                     command.arg("--virt-cpufreq");
+                    command.arg("--cpus").arg("sve=[auto=true]");
                 }
+            } else {
+                cpu_arg_command(
+                    &mut command,
+                    get_num_cpus()
+                        .context("Could not determine the number of CPUs in the system")?,
+                )
             }
-        } else if let Some(cpus) = get_num_cpus() {
-            command.arg("--cpus").arg(cpus.to_string());
-        } else {
-            bail!("Could not determine the number of CPUs in the system");
+        }
+        CpuTopology::CpuCount(count) => {
+            cpu_arg_command(&mut command, count.try_into().context("invalid cpu count")?)
         }
     }
 
@@ -1150,9 +1286,10 @@ fn run_vm(
         .context("failed to create control listener")?;
     command.arg("--socket").arg(add_preserved_fd(&mut preserved_fds, control_sock));
 
-    if let Some(dt_overlay) = config.device_tree_overlay {
-        command.arg("--device-tree-overlay").arg(add_preserved_fd(&mut preserved_fds, dt_overlay));
-    }
+    config.device_tree_overlays.into_iter().for_each(|dt_overlay| {
+        let arg = add_preserved_fd(&mut preserved_fds, dt_overlay);
+        command.arg("--device-tree-overlay").arg(arg);
+    });
 
     if cfg!(paravirtualized_devices) {
         if let Some(gpu_config) = &config.gpu_config {
@@ -1291,6 +1428,13 @@ fn run_vm(
         }
     }
 
+    for (fd, addr, size) in config.custom_memory_backing_files {
+        command.arg("--file-backed-mapping").arg(format!(
+            "{},addr={addr:#0x},size={size:#0x},rw,ram",
+            add_preserved_fd(&mut preserved_fds, fd)
+        ));
+    }
+
     debug!("Preserving FDs {:?}", preserved_fds);
     command.preserved_fds(preserved_fds);
 
@@ -1302,6 +1446,10 @@ fn run_vm(
                 if audio_config.use_speaker { 1 } else { 0 }
             ));
         }
+    }
+
+    if config.start_suspended {
+        command.arg("--suspended");
     }
 
     print_crosvm_args(&command);

@@ -22,6 +22,7 @@ import static android.os.ParcelFileDescriptor.MODE_READ_WRITE;
 
 import static java.util.Objects.requireNonNull;
 
+import android.annotation.FlaggedApi;
 import android.annotation.IntDef;
 import android.annotation.IntRange;
 import android.annotation.NonNull;
@@ -39,6 +40,9 @@ import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.os.PersistableBundle;
 import android.sysprop.HypervisorProperties;
+import android.system.virtualizationservice.AssignedDevices;
+import android.system.virtualizationservice.CpuOptions;
+import android.system.virtualizationservice.CustomMemoryBackingFile;
 import android.system.virtualizationservice.DiskImage;
 import android.system.virtualizationservice.Partition;
 import android.system.virtualizationservice.SharedPath;
@@ -48,6 +52,8 @@ import android.system.virtualizationservice.VirtualMachinePayloadConfig;
 import android.system.virtualizationservice.VirtualMachineRawConfig;
 import android.text.TextUtils;
 import android.util.Log;
+
+import com.android.system.virtualmachine.flags.Flags;
 
 import java.io.File;
 import java.io.FileInputStream;
@@ -601,6 +607,18 @@ public final class VirtualMachineConfig {
     }
 
     /**
+     * Returns whether this VM enabled the hint to use transparent huge pages.
+     *
+     * @see Builder#setShouldUseHugepages
+     * @hide
+     */
+    @SystemApi
+    @FlaggedApi(Flags.FLAG_PROMOTE_SET_SHOULD_USE_HUGEPAGES_TO_SYSTEM_API)
+    public boolean shouldUseHugepages() {
+        return mShouldUseHugepages;
+    }
+
+    /**
      * Tests if this config is compatible with other config. Being compatible means that the configs
      * can be interchangeably used for the same virtual machine; they do not change the VM identity
      * or secrets. Such changes include varying the number of CPUs or the size of the RAM. Changes
@@ -617,12 +635,11 @@ public final class VirtualMachineConfig {
         }
         return this.mDebugLevel == other.mDebugLevel
                 && this.mProtectedVm == other.mProtectedVm
-                && this.mEncryptedStorageBytes == other.mEncryptedStorageBytes
                 && this.mVmOutputCaptured == other.mVmOutputCaptured
                 && this.mVmConsoleInputSupported == other.mVmConsoleInputSupported
                 && this.mConnectVmConsole == other.mConnectVmConsole
-                && this.mConsoleInputDevice == other.mConsoleInputDevice
                 && (this.mVendorDiskImage == null) == (other.mVendorDiskImage == null)
+                && Objects.equals(this.mConsoleInputDevice, other.mConsoleInputDevice)
                 && Objects.equals(this.mPayloadConfigPath, other.mPayloadConfigPath)
                 && Objects.equals(this.mPayloadBinaryName, other.mPayloadBinaryName)
                 && Objects.equals(this.mPackageName, other.mPackageName)
@@ -790,15 +807,24 @@ public final class VirtualMachineConfig {
                         .orElse(null);
         config.protectedVm = this.mProtectedVm;
         config.memoryMib = bytesToMebiBytes(mMemoryBytes);
-        config.cpuTopology = (byte) this.mCpuTopology;
+        switch (this.mCpuTopology) {
+            case CPU_TOPOLOGY_MATCH_HOST:
+                config.cpuOptions = new CpuOptions();
+                config.cpuOptions.cpuTopology = CpuOptions.CpuTopology.matchHost(true);
+                break;
+            default:
+                config.cpuOptions = new CpuOptions();
+                config.cpuOptions.cpuTopology = CpuOptions.CpuTopology.cpuCount(1);
+                break;
+        }
         config.consoleInputDevice = mConsoleInputDevice;
-        config.devices = EMPTY_STRING_ARRAY;
+        config.devices = AssignedDevices.devices(EMPTY_STRING_ARRAY);
         config.platformVersion = "~1.0";
         config.audioConfig =
                 Optional.ofNullable(customImageConfig.getAudioConfig())
                         .map(ac -> ac.toParcelable())
                         .orElse(null);
-        config.noBalloon = !customImageConfig.useAutoMemoryBalloon();
+        config.balloon = customImageConfig.useAutoMemoryBalloon();
         config.usbConfig =
                 Optional.ofNullable(customImageConfig.getUsbConfig())
                         .map(
@@ -809,6 +835,7 @@ public final class VirtualMachineConfig {
                                 })
                         .orElse(null);
         config.teeServices = EMPTY_STRING_ARRAY;
+        config.customMemoryBackingFiles = new CustomMemoryBackingFile[0];
         return config;
     }
 
@@ -851,10 +878,12 @@ public final class VirtualMachineConfig {
         vsConfig.memoryMib = bytesToMebiBytes(mMemoryBytes);
         switch (mCpuTopology) {
             case CPU_TOPOLOGY_MATCH_HOST:
-                vsConfig.cpuTopology = android.system.virtualizationservice.CpuTopology.MATCH_HOST;
+                vsConfig.cpuOptions = new CpuOptions();
+                vsConfig.cpuOptions.cpuTopology = CpuOptions.CpuTopology.matchHost(true);
                 break;
             default:
-                vsConfig.cpuTopology = android.system.virtualizationservice.CpuTopology.ONE_CPU;
+                vsConfig.cpuOptions = new CpuOptions();
+                vsConfig.cpuOptions.cpuTopology = CpuOptions.CpuTopology.cpuCount(1);
                 break;
         }
 
@@ -1364,7 +1393,26 @@ public final class VirtualMachineConfig {
             return this;
         }
 
-        /** @hide */
+        /**
+         * Hints whether the VM should make use of the transparent huge pages feature.
+         *
+         * <p>Note: this API just provides a hint, whether the VM will actually use transparent huge
+         * pages additionally depends on the following:
+         *
+         * <ul>
+         *   <li>{@code /sys/kernel/mm/transparent_hugepages/shmem_enabled} should be configured
+         *       with the value {@code 'advise'}.
+         *   <li>Android host kernel version should be at least {@code android15-5.15}
+         * </ul>
+         *
+         * @see https://docs.kernel.org/admin-guide/mm/transhuge.html
+         * @see
+         *     https://cs.android.com/android/platform/superproject/main/+/main:packages/modules/Virtualization/docs/hugepages.md
+         * @hide
+         */
+        @SystemApi
+        @FlaggedApi(Flags.FLAG_PROMOTE_SET_SHOULD_USE_HUGEPAGES_TO_SYSTEM_API)
+        @NonNull
         public Builder setShouldUseHugepages(boolean shouldUseHugepages) {
             mShouldUseHugepages = shouldUseHugepages;
             return this;

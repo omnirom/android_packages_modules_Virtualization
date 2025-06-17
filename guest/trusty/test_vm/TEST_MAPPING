@@ -1,9 +1,0 @@
-{
-  "trusty-test_vm-presubmit": [
-  ],
-  "trusty-test_vm-postsubmit": [
-    {
-        "name": "TrustyTestVM_UnitTests"
-    }
-  ]
-}

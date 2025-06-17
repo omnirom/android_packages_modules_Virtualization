@@ -28,12 +28,13 @@ use pvmfw_avb::{
 use std::{
     fs,
     mem::{size_of, transmute, MaybeUninit},
+    string::String,
 };
 
 const MICRODROID_KERNEL_IMG_PATH: &str = "microdroid_kernel";
 const INITRD_NORMAL_IMG_PATH: &str = "microdroid_initrd_normal.img";
 const INITRD_DEBUG_IMG_PATH: &str = "microdroid_initrd_debuggable.img";
-const TRUSTY_SECURITY_VM_KERNEL_IMG_PATH: &str = "trusty_security_vm_signed";
+const TRUSTY_TEST_VM_KERNEL_IMG_PATH: &str = "trusty_test_vm_signed.bin";
 const PUBLIC_KEY_RSA4096_PATH: &str = "data/testkey_rsa4096_pub.bin";
 
 pub const PUBLIC_KEY_RSA2048_PATH: &str = "data/testkey_rsa2048_pub.bin";
@@ -61,8 +62,8 @@ pub fn load_latest_signed_kernel() -> Result<Vec<u8>> {
     Ok(fs::read(MICRODROID_KERNEL_IMG_PATH)?)
 }
 
-pub fn load_latest_trusty_security_vm_signed_kernel() -> Result<Vec<u8>> {
-    Ok(fs::read(TRUSTY_SECURITY_VM_KERNEL_IMG_PATH)?)
+pub fn load_latest_trusty_test_vm_signed_kernel() -> Result<Vec<u8>> {
+    Ok(fs::read(TRUSTY_TEST_VM_KERNEL_IMG_PATH)?)
 }
 
 pub fn load_latest_initrd_normal() -> Result<Vec<u8>> {
@@ -124,8 +125,7 @@ pub fn assert_latest_payload_verification_passes(
     let footer = extract_avb_footer(&kernel)?;
     let kernel_digest =
         hash(&[&hash(&[b"bootloader"]), &kernel[..usize::try_from(footer.original_image_size)?]]);
-    let capabilities =
-        if cfg!(llpvm_changes) { vec![Capability::SecretkeeperProtection] } else { vec![] };
+    let capabilities = vec![Capability::SecretkeeperProtection];
     let initrd_digest = Some(hash(&[&hash(&[initrd_salt]), initrd]));
     let expected_boot_data = VerifiedBootData {
         debug_level: expected_debug_level,
@@ -133,8 +133,11 @@ pub fn assert_latest_payload_verification_passes(
         initrd_digest,
         public_key: &public_key,
         capabilities,
-        rollback_index: if cfg!(llpvm_changes) { 1 } else { 0 },
+        // TODO(b/392081737): Capture expected rollback_index from build variables as we
+        // intend on auto-syncing rollback_index with security patch timestamps
+        rollback_index: 2,
         page_size,
+        name: None,
     };
     assert_eq!(expected_boot_data, verified_boot_data);
 
@@ -147,6 +150,7 @@ pub fn assert_payload_without_initrd_passes_verification(
     expected_rollback_index: u64,
     capabilities: Vec<Capability>,
     page_size: Option<usize>,
+    expected_name: Option<String>,
 ) -> Result<()> {
     let public_key = load_trusted_public_key()?;
     let verified_boot_data = verify_payload(
@@ -167,10 +171,31 @@ pub fn assert_payload_without_initrd_passes_verification(
         capabilities,
         rollback_index: expected_rollback_index,
         page_size,
+        name: expected_name,
     };
     assert_eq!(expected_boot_data, verified_boot_data);
 
     Ok(())
+}
+
+pub fn read_name(kernel: &[u8]) -> Result<Option<String>, PvmfwVerifyError> {
+    let public_key = load_trusted_public_key().unwrap();
+    let verified_boot_data = verify_payload(
+        kernel,
+        None, // initrd
+        &public_key,
+    )?;
+    Ok(verified_boot_data.name)
+}
+
+pub fn read_page_size(kernel: &[u8]) -> Result<Option<usize>, PvmfwVerifyError> {
+    let public_key = load_trusted_public_key().unwrap();
+    let verified_boot_data = verify_payload(
+        kernel,
+        None, // initrd
+        &public_key,
+    )?;
+    Ok(verified_boot_data.page_size)
 }
 
 pub fn hash(inputs: &[&[u8]]) -> Digest {

@@ -29,7 +29,11 @@
 #include <stdint.h>
 #include <stdio.h>
 #include <sys/capability.h>
+#include <sys/statvfs.h>
 #include <sys/system_properties.h>
+#ifdef __MICRODROID_TEST_PAYLOAD_USES_LIBICU__
+#include <unicode/uchar.h>
+#endif
 #include <unistd.h>
 #include <vm_main.h>
 #include <vm_payload_restricted.h>
@@ -99,6 +103,9 @@ Result<void> run_echo_reverse_server(borrowed_fd listening_fd) {
         char* line = nullptr;
         size_t size = 0;
         if (getline(&line, &size, input) < 0) {
+            if (errno == 0) {
+                return {}; // the input was closed
+            }
             return ErrnoError() << "Failed to read";
         }
 
@@ -136,12 +143,12 @@ Result<void> start_echo_reverse_server() {
     }
 
     std::thread accept_thread{[listening_fd = std::move(server_fd)] {
-        auto result = run_echo_reverse_server(listening_fd);
-        if (!result.ok()) {
-            __android_log_write(ANDROID_LOG_ERROR, TAG, result.error().message().c_str());
-            // Make sure the VM exits so the test will fail solidly
-            exit(1);
+        Result<void> result;
+        while ((result = run_echo_reverse_server(listening_fd)).ok()) {
         }
+        __android_log_write(ANDROID_LOG_ERROR, TAG, result.error().message().c_str());
+        // Make sure the VM exits so the test will fail solidly
+        exit(1);
     }};
     accept_thread.detach();
 
@@ -223,6 +230,23 @@ Result<void> start_test_service() {
             } else {
                 *out = path_c;
             }
+            return ScopedAStatus::ok();
+        }
+
+        ScopedAStatus getEncryptedStorageSize(int64_t *out) override {
+            const char* path_c = AVmPayload_getEncryptedStoragePath();
+            if (path_c == nullptr) {
+                *out = 0;
+                return ScopedAStatus::ok();
+            }
+            struct statvfs buffer;
+            if (statvfs(path_c, &buffer) != 0) {
+                std::string msg = "statvfs " + std::string(path_c) + " failed :  " +
+                    std::strerror(errno);
+                return ScopedAStatus::fromExceptionCodeWithMessage(EX_SERVICE_SPECIFIC,
+                                                                   msg.c_str());
+            }
+            *out= buffer.f_blocks * buffer.f_frsize;
             return ScopedAStatus::ok();
         }
 
@@ -342,6 +366,66 @@ Result<void> start_test_service() {
             out->append(line, nread);
             free(line);
             return ScopedAStatus::ok();
+        }
+
+        ScopedAStatus insecurelyReadPayloadRpData(std::array<uint8_t, 32>* out) override {
+            if (__builtin_available(android 36, *)) {
+                int32_t ret = AVmPayload_readRollbackProtectedSecret(out->data(), 32);
+                if (ret != 32) {
+                    return ScopedAStatus::fromServiceSpecificError(ret);
+                }
+                return ScopedAStatus::ok();
+            } else {
+                return ScopedAStatus::fromExceptionCodeWithMessage(EX_SERVICE_SPECIFIC,
+                                                                   "not available before SDK 36");
+            }
+        }
+
+        ScopedAStatus insecurelyWritePayloadRpData(
+                const std::array<uint8_t, 32>& inputData) override {
+            if (__builtin_available(android 36, *)) {
+                int32_t ret = AVmPayload_writeRollbackProtectedSecret(inputData.data(), 32);
+                if (ret != 32) {
+                    return ScopedAStatus::fromServiceSpecificError(ret);
+                }
+                return ScopedAStatus::ok();
+            } else {
+                return ScopedAStatus::fromExceptionCodeWithMessage(EX_SERVICE_SPECIFIC,
+                                                                   "not available before SDK 36");
+            }
+        }
+
+        ScopedAStatus isNewInstance(bool* is_new_instance_out) override {
+            if (__builtin_available(android 36, *)) {
+                *is_new_instance_out = AVmPayload_isNewInstance();
+                return ScopedAStatus::ok();
+            } else {
+                return ScopedAStatus::fromExceptionCodeWithMessage(EX_SERVICE_SPECIFIC,
+                                                                   "not available before SDK 36");
+            }
+        }
+
+        ScopedAStatus checkLibIcuIsAccessible() override {
+#ifdef __MICRODROID_TEST_PAYLOAD_USES_LIBICU__
+            static constexpr const char* kLibIcuPath = "/apex/com.android.i18n/lib64/libicu.so";
+            if (access(kLibIcuPath, R_OK) == 0) {
+                if (!u_hasBinaryProperty(U'❤' /* Emoji heart U+2764 */, UCHAR_EMOJI)) {
+                    return ScopedAStatus::fromExceptionCodeWithMessage(EX_SERVICE_SPECIFIC,
+                                                                       "libicu broken!");
+                }
+                return ScopedAStatus::ok();
+            } else {
+                std::string msg = "failed to access " + std::string(kLibIcuPath) + "(" +
+                        std::to_string(errno) + ")";
+                return ScopedAStatus::fromExceptionCodeWithMessage(EX_SERVICE_SPECIFIC,
+                                                                   msg.c_str());
+            }
+#else
+            return ScopedAStatus::
+                    fromExceptionCodeWithMessage(EX_SERVICE_SPECIFIC,
+                                                 "should be only used together with "
+                                                 "MicrodroidTestNativeLibWithLibIcu.so payload");
+#endif
         }
 
         ScopedAStatus quit() override { exit(0); }

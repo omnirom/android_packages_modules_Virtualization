@@ -37,8 +37,9 @@ use std::io::Write;
 use std::mem::size_of;
 use std::os::unix::io::AsRawFd;
 use std::path::{Path, PathBuf};
-use zerocopy::AsBytes;
-use zerocopy::FromZeroes;
+use zerocopy::FromZeros;
+use zerocopy::Immutable;
+use zerocopy::IntoBytes;
 
 /// Exposes DmCryptTarget & related builder
 pub mod crypt;
@@ -88,7 +89,7 @@ fn dm_dev_remove(dm: &DeviceMapper, ioctl: *mut DmIoctl) -> Result<i32> {
 // `DmTargetSpec` is the header of the data structure for a device-mapper target. When doing the
 // ioctl, one of more `DmTargetSpec` (and its body) are appened to the `DmIoctl` struct.
 #[repr(C)]
-#[derive(Copy, Clone, AsBytes, FromZeroes)]
+#[derive(Copy, Clone, Immutable, IntoBytes, FromZeros)]
 struct DmTargetSpec {
     sector_start: u64,
     length: u64, // number of 512 sectors
@@ -229,13 +230,10 @@ fn uuid(node_id: &[u8]) -> Result<String> {
 }
 
 #[cfg(test)]
-rdroidtest::test_main!();
-
-#[cfg(test)]
 mod tests {
     use super::*;
+    use crate::loopdevice::LoopConfigOptions;
     use crypt::{CipherType, DmCryptTargetBuilder};
-    use rdroidtest::{ignore_if, rdroidtest};
     use rustutils::system_properties;
     use std::fs::{read, File, OpenOptions};
     use std::io::Write;
@@ -292,25 +290,29 @@ mod tests {
         }
     }
 
-    #[rdroidtest]
+    #[test]
     fn mapping_again_keeps_data_xts() {
         mapping_again_keeps_data(&KEY_SET_XTS, "name1");
     }
 
-    #[rdroidtest]
-    #[ignore_if(!is_hctr2_supported())]
+    #[test]
     fn mapping_again_keeps_data_hctr2() {
+        if !is_hctr2_supported() {
+            return;
+        }
         mapping_again_keeps_data(&KEY_SET_HCTR2, "name2");
     }
 
-    #[rdroidtest]
+    #[test]
     fn data_inaccessible_with_diff_key_xts() {
         data_inaccessible_with_diff_key(&KEY_SET_XTS, "name3");
     }
 
-    #[rdroidtest]
-    #[ignore_if(!is_hctr2_supported())]
+    #[test]
     fn data_inaccessible_with_diff_key_hctr2() {
+        if !is_hctr2_supported() {
+            return;
+        }
         data_inaccessible_with_diff_key(&KEY_SET_HCTR2, "name4");
     }
 
@@ -327,10 +329,10 @@ mod tests {
             backing_file,
             0,
             sz,
-            /* direct_io */ true,
-            /* writable */ true,
+            &LoopConfigOptions { direct_io: true, writable: true, ..Default::default() },
         )
-        .unwrap();
+        .unwrap()
+        .path;
         let device_diff = device.to_owned() + "_diff";
 
         scopeguard::defer! {
@@ -371,10 +373,10 @@ mod tests {
             backing_file,
             0,
             sz,
-            /* direct_io */ true,
-            /* writable */ true,
+            &LoopConfigOptions { direct_io: true, writable: true, ..Default::default() },
         )
-        .unwrap();
+        .unwrap()
+        .path;
         let device_diff = device.to_owned() + "_diff";
         scopeguard::defer! {
             loopdevice::detach(&data_device).unwrap();

@@ -22,11 +22,14 @@ use core::result;
 use log::{info, warn};
 use static_assertions::const_assert_eq;
 use vmbase::util::RangeExt;
-use zerocopy::{FromBytes, FromZeroes};
+use zerocopy::FromBytes;
+use zerocopy::Immutable;
+use zerocopy::KnownLayout;
+use zerocopy::Ref;
 
 /// Configuration data header.
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, FromZeroes, FromBytes)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout)]
 struct Header {
     /// Magic number; must be `Header::MAGIC`.
     magic: u32,
@@ -121,7 +124,7 @@ impl Header {
 
 #[derive(Clone, Copy, Debug)]
 pub enum Entry {
-    Bcc,
+    DiceHandover,
     DebugPolicy,
     VmDtbo,
     VmBaseDtbo,
@@ -133,26 +136,26 @@ impl Entry {
     const COUNT: usize = Self::_VARIANT_COUNT as usize;
 
     const ALL_ENTRIES: [Entry; Self::COUNT] =
-        [Self::Bcc, Self::DebugPolicy, Self::VmDtbo, Self::VmBaseDtbo];
+        [Self::DiceHandover, Self::DebugPolicy, Self::VmDtbo, Self::VmBaseDtbo];
 }
 
 #[derive(Default)]
 pub struct Entries<'a> {
-    pub bcc: &'a mut [u8],
+    pub dice_handover: Option<&'a mut [u8]>,
     pub debug_policy: Option<&'a [u8]>,
     pub vm_dtbo: Option<&'a mut [u8]>,
     pub vm_ref_dt: Option<&'a [u8]>,
 }
 
 #[repr(packed)]
-#[derive(Clone, Copy, Debug, FromZeroes, FromBytes)]
+#[derive(Clone, Copy, Debug, FromBytes, Immutable, KnownLayout)]
 struct HeaderEntry {
     offset: u32,
     size: u32,
 }
 
 #[repr(C, packed)]
-#[derive(Clone, Copy, Debug, Eq, FromZeroes, FromBytes, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, FromBytes, Immutable, KnownLayout, PartialEq)]
 pub struct Version {
     minor: u16,
     major: u16,
@@ -209,8 +212,8 @@ impl<'a> Config<'a> {
         }
 
         let (header, rest) =
-            zerocopy::Ref::<_, Header>::new_from_prefix(bytes).ok_or(Error::HeaderMisaligned)?;
-        let header = header.into_ref();
+            Ref::<_, Header>::new_from_prefix(bytes).ok_or(Error::HeaderMisaligned)?;
+        let header = Ref::into_ref(header);
 
         if header.magic != Header::MAGIC {
             return Err(Error::InvalidMagic);
@@ -266,8 +269,8 @@ impl<'a> Config<'a> {
                 entry_size,
             );
         }
-        // Ensures that BCC exists.
-        ranges[Entry::Bcc as usize].ok_or(Error::MissingEntry(Entry::Bcc))?;
+        // Ensures that the DICE handover is present.
+        ranges[Entry::DiceHandover as usize].ok_or(Error::MissingEntry(Entry::DiceHandover))?;
 
         Ok(Self { body, ranges })
     }
@@ -290,15 +293,12 @@ impl<'a> Config<'a> {
                 entries[i] = Some(chunk);
             }
         }
-        let [bcc, debug_policy, vm_dtbo, vm_ref_dt] = entries;
-
-        // The platform BCC has always been required.
-        let bcc = bcc.unwrap();
+        let [dice_handover, debug_policy, vm_dtbo, vm_ref_dt] = entries;
 
         // We have no reason to mutate so drop the `mut`.
         let debug_policy = debug_policy.map(|x| &*x);
         let vm_ref_dt = vm_ref_dt.map(|x| &*x);
 
-        Entries { bcc, debug_policy, vm_dtbo, vm_ref_dt }
+        Entries { dice_handover, debug_policy, vm_dtbo, vm_ref_dt }
     }
 }

@@ -17,24 +17,26 @@
 #[cfg(target_arch = "aarch64")]
 pub mod aarch64;
 
-/// Write with well-defined compiled behavior.
-///
-/// See https://github.com/rust-lang/rust/issues/131894
-///
-/// # Safety
-///
-/// `dst` must be valid for writes.
-#[inline]
-pub unsafe fn write_volatile_u8(dst: *mut u8, src: u8) {
-    cfg_if::cfg_if! {
-        if #[cfg(target_arch = "aarch64")] {
-            // SAFETY: `dst` is valid for writes.
-            unsafe { aarch64::strb(dst, src) }
-        } else {
-            compile_error!("Unsupported target_arch")
-        }
-    }
-}
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::platform;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::layout;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::linker;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::dbm;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::rand;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64::uart;
+
+#[cfg(target_arch = "aarch64")]
+pub use aarch64_paging::paging::VirtualAddress;
 
 /// Flush `size` bytes of data cache by virtual address.
 #[inline]
@@ -44,7 +46,6 @@ pub(crate) fn flush_region(start: usize, size: usize) {
             let line_size = aarch64::min_dcache_line_size();
             let end = start + size;
             let start = crate::util::unchecked_align_down(start, line_size);
-
             for line in (start..end).step_by(line_size) {
                 crate::dc!("cvau", line);
             }

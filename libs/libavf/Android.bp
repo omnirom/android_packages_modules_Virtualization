@@ -10,6 +10,10 @@ rust_bindgen {
     source_stem: "bindings",
     bindgen_flags: ["--default-enum-style rust"],
     apex_available: ["com.android.virt"],
+    visibility: [
+        "//packages/modules/Virtualization/tests/vts",
+        "//packages/modules/Virtualization/tests/old_images_avf_test",
+    ],
 }
 
 rust_defaults {
@@ -34,7 +38,6 @@ rust_defaults {
 rust_ffi_static {
     name: "libavf_impl",
     defaults: ["libavf.default"],
-    export_include_dirs: ["include"],
 }
 
 cc_library {
@@ -49,10 +52,10 @@ cc_library {
         "libbinder_rpc_unstable",
         "liblog",
     ],
-    export_static_lib_headers: ["libavf_impl"],
-    apex_available: ["com.android.virt"],
+    export_include_dirs: ["include"],
     version_script: "libavf.map.txt",
     stubs: {
         symbol_file: "libavf.map.txt",
     },
+    apex_available: ["com.android.virt"],
 }

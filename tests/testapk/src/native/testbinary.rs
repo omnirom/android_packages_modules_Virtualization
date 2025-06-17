@@ -24,9 +24,7 @@ use com_android_microdroid_testservice::{
     },
     binder::{BinderFeatures, ExceptionCode, Interface, Result as BinderResult, Status, Strong},
 };
-use cstr::cstr;
 use log::{error, info};
-use std::panic;
 use std::process::exit;
 use std::string::String;
 use std::vec::Vec;
@@ -40,10 +38,6 @@ fn main() {
             .with_tag("microdroid_testlib_rust")
             .with_max_level(log::LevelFilter::Debug),
     );
-    // Redirect panic messages to logcat.
-    panic::set_hook(Box::new(|panic_info| {
-        error!("{panic_info}");
-    }));
     if let Err(e) = try_main() {
         error!("failed with {:?}", e);
         exit(1);
@@ -93,6 +87,10 @@ impl ITestService for TestService {
 
     // Everything below here is unimplemented. Implementations may be added as needed.
 
+    fn getEncryptedStorageSize(&self) -> BinderResult<i64> {
+        unimplemented()
+    }
+
     fn readProperty(&self, _: &str) -> BinderResult<String> {
         unimplemented()
     }
@@ -132,10 +130,22 @@ impl ITestService for TestService {
     fn readLineFromConsole(&self) -> BinderResult<String> {
         unimplemented()
     }
+    fn insecurelyReadPayloadRpData(&self) -> BinderResult<[u8; 32]> {
+        unimplemented()
+    }
+    fn insecurelyWritePayloadRpData(&self, _: &[u8; 32]) -> BinderResult<()> {
+        unimplemented()
+    }
+    fn isNewInstance(&self) -> BinderResult<bool> {
+        unimplemented()
+    }
+    fn checkLibIcuIsAccessible(&self) -> BinderResult<()> {
+        unimplemented()
+    }
 }
 
 fn unimplemented<T>() -> BinderResult<T> {
-    let message = cstr!("Got a call to an unimplemented ITestService method in testbinary.rs");
+    let message = c"Got a call to an unimplemented ITestService method in testbinary.rs";
     error!("{message:?}");
     Err(Status::new_exception(ExceptionCode::UNSUPPORTED_OPERATION, Some(message)))
 }

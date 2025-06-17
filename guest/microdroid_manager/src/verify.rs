@@ -14,16 +14,15 @@
 
 use crate::instance::{ApexData, ApkData, MicrodroidData};
 use crate::payload::{get_apex_data_from_payload, to_metadata};
-use crate::{is_strict_boot, MicrodroidError};
+use crate::MicrodroidError;
 use anyhow::{anyhow, ensure, Context, Result};
-use apkmanifest::get_manifest_info;
+use apkmanifest::{get_manifest_info, ApkManifestInfo};
 use apkverify::{extract_signed_data, verify, V4Signature};
 use glob::glob;
 use itertools::sorted;
 use log::{info, warn};
 use microdroid_metadata::{write_metadata, Metadata};
 use openssl::sha::sha512;
-use rand::Fill;
 use rustutils::system_properties;
 use std::fs::OpenOptions;
 use std::path::Path;
@@ -168,25 +167,19 @@ pub fn verify_payload(
     // verified is consistent with the root hash) or because we have the saved APK data which will
     // be checked as identical to the data we have verified.
 
-    let salt = if cfg!(llpvm_changes) || is_strict_boot() {
-        // Salt is obsolete with llpvm_changes.
-        vec![0u8; 64]
-    } else if let Some(saved_data) = saved_data {
-        // Use the salt from a verified instance.
-        saved_data.salt.clone()
-    } else {
-        // Generate a salt for a new instance.
-        let mut salt = vec![0u8; 64];
-        salt.as_mut_slice().try_fill(&mut rand::thread_rng())?;
-        salt
-    };
-
     Ok(MicrodroidData {
-        salt,
         apk_data: main_apk_data,
         extra_apks_data,
         apex_data: apex_data_from_payload,
     })
+}
+
+fn validate_manifest_info(info: &ApkManifestInfo) -> Result<()> {
+    ensure!(
+        info.has_relaxed_rollback_protection_permission == info.rollback_index.is_some(),
+        MicrodroidError::PayloadVerificationFailed(String::from("to opt in relaxed rollback protection scheme manifest must request android.permission.USE_RELAXED_MICRODROID_ROLLBACK_PROTECTION permission and set the android.system.virtualmachine.ROLLBACK_INDEX property"))
+    );
+    Ok(())
 }
 
 fn get_data_from_apk(
@@ -203,11 +196,14 @@ fn get_data_from_apk(
         .map_err(|e| warn!("Failed to read manifest info from APK: {e:?}"))
         .unwrap_or_default();
 
+    validate_manifest_info(&manifest_info)?;
+
     Ok(ApkData {
         root_hash: root_hash.into(),
         cert_hash,
         package_name: manifest_info.package,
         version_code: manifest_info.version_code,
+        rollback_index: manifest_info.rollback_index,
     })
 }
 

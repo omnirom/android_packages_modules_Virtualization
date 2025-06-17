@@ -273,9 +273,6 @@ fn round_to_multiple(n: u64, unit: u64) -> Result<u64> {
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct MicrodroidData {
-    // `salt` is obsolete, it was used as a differentiator for non-protected VM instances running
-    // same payload. Instance-id (present in DT) is used for that now.
-    pub salt: Vec<u8>, // Should be [u8; 64] but that isn't serializable.
     pub apk_data: ApkData,
     pub extra_apks_data: Vec<ApkData>,
     pub apex_data: Vec<ApexData>,
@@ -293,6 +290,7 @@ pub struct ApkData {
     pub cert_hash: Vec<u8>,
     pub package_name: String,
     pub version_code: u64,
+    pub rollback_index: Option<u32>,
 }
 
 impl ApkData {

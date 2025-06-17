@@ -14,22 +14,18 @@
 
 //! Low-level entry and exit points of pvmfw.
 
+use crate::arch::payload::jump_to_payload;
 use crate::config;
-use crate::memory;
-use core::arch::asm;
-use core::mem::size_of;
-use core::ops::Range;
+use crate::memory::MemorySlices;
 use core::slice;
 use log::error;
 use log::warn;
 use log::LevelFilter;
-use vmbase::util::RangeExt as _;
 use vmbase::{
-    arch::aarch64::min_dcache_line_size,
-    configure_heap, console_writeln, layout, limit_stack_size, main,
+    configure_heap, console_writeln, limit_stack_size, main,
     memory::{
-        deactivate_dynamic_page_tables, map_image_footer, unshare_all_memory,
-        unshare_all_mmio_except_uart, unshare_uart, MemoryTrackerError, SIZE_128KB, SIZE_4KB,
+        map_image_footer, unshare_all_memory, unshare_all_mmio_except_uart, unshare_uart,
+        MemoryTrackerError, SIZE_128KB, SIZE_4KB,
     },
     power::reboot,
 };
@@ -37,8 +33,8 @@ use zeroize::Zeroize;
 
 #[derive(Debug, Clone)]
 pub enum RebootReason {
-    /// A malformed BCC was received.
-    InvalidBcc,
+    /// A malformed DICE handover was received.
+    InvalidDiceHandover,
     /// An invalid configuration was appended to pvmfw.
     InvalidConfig,
     /// An unexpected internal error happened.
@@ -58,7 +54,7 @@ pub enum RebootReason {
 impl RebootReason {
     pub fn as_avf_reboot_string(&self) -> &'static str {
         match self {
-            Self::InvalidBcc => "PVM_FIRMWARE_INVALID_BCC",
+            Self::InvalidDiceHandover => "PVM_FIRMWARE_INVALID_DICE_HANDOVER",
             Self::InvalidConfig => "PVM_FIRMWARE_INVALID_CONFIG_DATA",
             Self::InternalError => "PVM_FIRMWARE_INTERNAL_ERROR",
             Self::InvalidFdt => "PVM_FIRMWARE_INVALID_FDT",
@@ -74,22 +70,36 @@ main!(start);
 configure_heap!(SIZE_128KB);
 limit_stack_size!(SIZE_4KB * 12);
 
+#[derive(Debug)]
+enum NextStage {
+    LinuxBoot(usize),
+    LinuxBootWithUart(usize),
+}
+
 /// Entry point for pVM firmware.
 pub fn start(fdt_address: u64, payload_start: u64, payload_size: u64, _arg3: u64) {
-    // Limitations in this function:
-    // - can't access non-pvmfw memory (only statically-mapped memory)
-    // - can't access MMIO (except the console, already configured by vmbase)
+    let fdt_address = fdt_address.try_into().unwrap();
+    let payload_start = payload_start.try_into().unwrap();
+    let payload_size = payload_size.try_into().unwrap();
 
-    match main_wrapper(fdt_address as usize, payload_start as usize, payload_size as usize) {
-        Ok((entry, bcc, keep_uart)) => {
-            jump_to_payload(fdt_address, entry.try_into().unwrap(), bcc, keep_uart)
-        }
-        Err(e) => {
-            const REBOOT_REASON_CONSOLE: usize = 1;
-            console_writeln!(REBOOT_REASON_CONSOLE, "{}", e.as_avf_reboot_string());
-            reboot()
-        }
-    }
+    let reboot_reason = match main_wrapper(fdt_address, payload_start, payload_size) {
+        Err(r) => r,
+        Ok((next_stage, slices)) => match next_stage {
+            NextStage::LinuxBootWithUart(ep) => jump_to_payload(ep, &slices),
+            NextStage::LinuxBoot(ep) => {
+                if let Err(e) = unshare_uart() {
+                    error!("Failed to unmap UART: {e}");
+                    RebootReason::InternalError
+                } else {
+                    jump_to_payload(ep, &slices)
+                }
+            }
+        },
+    };
+
+    const REBOOT_REASON_CONSOLE: usize = 1;
+    console_writeln!(REBOOT_REASON_CONSOLE, "{}", reboot_reason.as_avf_reboot_string()).unwrap();
+    reboot()
 
     // if we reach this point and return, vmbase::entry::rust_entry() will call power::shutdown().
 }
@@ -98,11 +108,11 @@ pub fn start(fdt_address: u64, payload_start: u64, payload_size: u64, _arg3: u64
 ///
 /// Provide the abstractions necessary for start() to abort the pVM boot and for main() to run with
 /// the assumption that its environment has been properly configured.
-fn main_wrapper(
+fn main_wrapper<'a>(
     fdt: usize,
     payload: usize,
     payload_size: usize,
-) -> Result<(usize, Range<usize>, bool), RebootReason> {
+) -> Result<(NextStage, MemorySlices<'a>), RebootReason> {
     // Limitations in this function:
     // - only access MMIO once (and while) it has been mapped and configured
     // - only perform logging once the logger has been initialized
@@ -122,23 +132,29 @@ fn main_wrapper(
 
     let config_entries = appended.get_entries();
 
-    let slices = memory::MemorySlices::new(fdt, payload, payload_size)?;
+    let mut slices = MemorySlices::new(fdt, payload, payload_size)?;
 
     // This wrapper allows main() to be blissfully ignorant of platform details.
-    let (next_bcc, debuggable_payload) = crate::main(
+    let (next_dice_handover, debuggable_payload) = crate::main(
         slices.fdt,
         slices.kernel,
         slices.ramdisk,
-        config_entries.bcc,
+        config_entries.dice_handover.as_deref(),
         config_entries.debug_policy,
         config_entries.vm_dtbo,
         config_entries.vm_ref_dt,
     )?;
+    if let Some(r) = next_dice_handover {
+        slices.add_dice_handover(r);
+    }
+
     // Keep UART MMIO_GUARD-ed for debuggable payloads, to enable earlycon.
     let keep_uart = cfg!(debuggable_vms_improvements) && debuggable_payload;
 
     // Writable-dirty regions will be flushed when MemoryTracker is dropped.
-    config_entries.bcc.zeroize();
+    if let Some(r) = config_entries.dice_handover {
+        r.zeroize();
+    }
 
     unshare_all_mmio_except_uart().map_err(|e| {
         error!("Failed to unshare MMIO ranges: {e}");
@@ -146,157 +162,17 @@ fn main_wrapper(
     })?;
     unshare_all_memory();
 
-    Ok((slices.kernel.as_ptr() as usize, next_bcc, keep_uart))
+    let next_stage = select_next_stage(slices.kernel, keep_uart);
+
+    Ok((next_stage, slices))
 }
 
-fn jump_to_payload(fdt_address: u64, payload_start: u64, bcc: Range<usize>, keep_uart: bool) -> ! {
-    if !keep_uart {
-        unshare_uart().unwrap();
+fn select_next_stage(kernel: &[u8], keep_uart: bool) -> NextStage {
+    if keep_uart {
+        NextStage::LinuxBootWithUart(kernel.as_ptr() as _)
+    } else {
+        NextStage::LinuxBoot(kernel.as_ptr() as _)
     }
-
-    deactivate_dynamic_page_tables();
-
-    const ASM_STP_ALIGN: usize = size_of::<u64>() * 2;
-    const SCTLR_EL1_RES1: u64 = (0b11 << 28) | (0b101 << 20) | (0b1 << 11);
-    // Stage 1 instruction access cacheability is unaffected.
-    const SCTLR_EL1_I: u64 = 0b1 << 12;
-    // SETEND instruction disabled at EL0 in aarch32 mode.
-    const SCTLR_EL1_SED: u64 = 0b1 << 8;
-    // Various IT instructions are disabled at EL0 in aarch32 mode.
-    const SCTLR_EL1_ITD: u64 = 0b1 << 7;
-
-    const SCTLR_EL1_VAL: u64 = SCTLR_EL1_RES1 | SCTLR_EL1_ITD | SCTLR_EL1_SED | SCTLR_EL1_I;
-
-    let scratch = layout::data_bss_range();
-
-    assert_ne!(scratch.end - scratch.start, 0, "scratch memory is empty.");
-    assert_eq!(scratch.start.0 % ASM_STP_ALIGN, 0, "scratch memory is misaligned.");
-    assert_eq!(scratch.end.0 % ASM_STP_ALIGN, 0, "scratch memory is misaligned.");
-
-    assert!(bcc.is_within(&(scratch.start.0..scratch.end.0)));
-    assert_eq!(bcc.start % ASM_STP_ALIGN, 0, "Misaligned guest BCC.");
-    assert_eq!(bcc.end % ASM_STP_ALIGN, 0, "Misaligned guest BCC.");
-
-    let stack = layout::stack_range();
-
-    assert_ne!(stack.end - stack.start, 0, "stack region is empty.");
-    assert_eq!(stack.start.0 % ASM_STP_ALIGN, 0, "Misaligned stack region.");
-    assert_eq!(stack.end.0 % ASM_STP_ALIGN, 0, "Misaligned stack region.");
-
-    let eh_stack = layout::eh_stack_range();
-
-    assert_ne!(eh_stack.end - eh_stack.start, 0, "EH stack region is empty.");
-    assert_eq!(eh_stack.start.0 % ASM_STP_ALIGN, 0, "Misaligned EH stack region.");
-    assert_eq!(eh_stack.end.0 % ASM_STP_ALIGN, 0, "Misaligned EH stack region.");
-
-    // Zero all memory that could hold secrets and that can't be safely written to from Rust.
-    // Disable the exception vector, caches and page table and then jump to the payload at the
-    // given address, passing it the given FDT pointer.
-    //
-    // SAFETY: We're exiting pvmfw by passing the register values we need to a noreturn asm!().
-    unsafe {
-        asm!(
-            "cmp {scratch}, {bcc}",
-            "b.hs 1f",
-
-            // Zero .data & .bss until BCC.
-            "0: stp xzr, xzr, [{scratch}], 16",
-            "cmp {scratch}, {bcc}",
-            "b.lo 0b",
-
-            "1:",
-            // Skip BCC.
-            "mov {scratch}, {bcc_end}",
-            "cmp {scratch}, {scratch_end}",
-            "b.hs 1f",
-
-            // Keep zeroing .data & .bss.
-            "0: stp xzr, xzr, [{scratch}], 16",
-            "cmp {scratch}, {scratch_end}",
-            "b.lo 0b",
-
-            "1:",
-            // Flush d-cache over .data & .bss (including BCC).
-            "0: dc cvau, {cache_line}",
-            "add {cache_line}, {cache_line}, {dcache_line_size}",
-            "cmp {cache_line}, {scratch_end}",
-            "b.lo 0b",
-
-            "mov {cache_line}, {stack}",
-            // Zero stack region.
-            "0: stp xzr, xzr, [{stack}], 16",
-            "cmp {stack}, {stack_end}",
-            "b.lo 0b",
-
-            // Flush d-cache over stack region.
-            "0: dc cvau, {cache_line}",
-            "add {cache_line}, {cache_line}, {dcache_line_size}",
-            "cmp {cache_line}, {stack_end}",
-            "b.lo 0b",
-
-            "mov {cache_line}, {eh_stack}",
-            // Zero EH stack region.
-            "0: stp xzr, xzr, [{eh_stack}], 16",
-            "cmp {eh_stack}, {eh_stack_end}",
-            "b.lo 0b",
-
-            // Flush d-cache over EH stack region.
-            "0: dc cvau, {cache_line}",
-            "add {cache_line}, {cache_line}, {dcache_line_size}",
-            "cmp {cache_line}, {eh_stack_end}",
-            "b.lo 0b",
-
-            "msr sctlr_el1, {sctlr_el1_val}",
-            "isb",
-            "mov x1, xzr",
-            "mov x2, xzr",
-            "mov x3, xzr",
-            "mov x4, xzr",
-            "mov x5, xzr",
-            "mov x6, xzr",
-            "mov x7, xzr",
-            "mov x8, xzr",
-            "mov x9, xzr",
-            "mov x10, xzr",
-            "mov x11, xzr",
-            "mov x12, xzr",
-            "mov x13, xzr",
-            "mov x14, xzr",
-            "mov x15, xzr",
-            "mov x16, xzr",
-            "mov x17, xzr",
-            "mov x18, xzr",
-            "mov x19, xzr",
-            "mov x20, xzr",
-            "mov x21, xzr",
-            "mov x22, xzr",
-            "mov x23, xzr",
-            "mov x24, xzr",
-            "mov x25, xzr",
-            "mov x26, xzr",
-            "mov x27, xzr",
-            "mov x28, xzr",
-            "mov x29, xzr",
-            "msr ttbr0_el1, xzr",
-            // Ensure that CMOs have completed before entering payload.
-            "dsb nsh",
-            "br x30",
-            sctlr_el1_val = in(reg) SCTLR_EL1_VAL,
-            bcc = in(reg) u64::try_from(bcc.start).unwrap(),
-            bcc_end = in(reg) u64::try_from(bcc.end).unwrap(),
-            cache_line = in(reg) u64::try_from(scratch.start.0).unwrap(),
-            scratch = in(reg) u64::try_from(scratch.start.0).unwrap(),
-            scratch_end = in(reg) u64::try_from(scratch.end.0).unwrap(),
-            stack = in(reg) u64::try_from(stack.start.0).unwrap(),
-            stack_end = in(reg) u64::try_from(stack.end.0).unwrap(),
-            eh_stack = in(reg) u64::try_from(eh_stack.start.0).unwrap(),
-            eh_stack_end = in(reg) u64::try_from(eh_stack.end.0).unwrap(),
-            dcache_line_size = in(reg) u64::try_from(min_dcache_line_size()).unwrap(),
-            in("x0") fdt_address,
-            in("x30") payload_start,
-            options(noreturn),
-        );
-    };
 }
 
 fn get_appended_data_slice() -> Result<&'static mut [u8], MemoryTrackerError> {
@@ -309,8 +185,8 @@ fn get_appended_data_slice() -> Result<&'static mut [u8], MemoryTrackerError> {
 enum AppendedPayload<'a> {
     /// Configuration data.
     Config(config::Config<'a>),
-    /// Deprecated raw BCC, as used in Android T.
-    LegacyBcc(&'a mut [u8]),
+    /// Deprecated raw DICE handover, as used in Android T.
+    LegacyDiceHandover(&'a mut [u8]),
 }
 
 impl<'a> AppendedPayload<'a> {
@@ -330,9 +206,12 @@ impl<'a> AppendedPayload<'a> {
                 // SAFETY: Pointer to a valid mut (not accessed elsewhere), 'a lifetime re-used.
                 let data: &'a mut _ = unsafe { &mut *data_ptr };
 
-                const BCC_SIZE: usize = SIZE_4KB;
-                warn!("Assuming the appended data at {:?} to be a raw BCC", data.as_ptr());
-                Some(Self::LegacyBcc(&mut data[..BCC_SIZE]))
+                const DICE_CHAIN_SIZE: usize = SIZE_4KB;
+                warn!(
+                    "Assuming the appended data at {:?} to be a raw DICE handover",
+                    data.as_ptr()
+                );
+                Some(Self::LegacyDiceHandover(&mut data[..DICE_CHAIN_SIZE]))
             }
             Err(e) => {
                 error!("Invalid configuration data at {data_ptr:?}: {e}");
@@ -344,7 +223,9 @@ impl<'a> AppendedPayload<'a> {
     fn get_entries(self) -> config::Entries<'a> {
         match self {
             Self::Config(cfg) => cfg.get_entries(),
-            Self::LegacyBcc(bcc) => config::Entries { bcc, ..Default::default() },
+            Self::LegacyDiceHandover(d) => {
+                config::Entries { dice_handover: Some(d), ..Default::default() }
+            }
         }
     }
 }

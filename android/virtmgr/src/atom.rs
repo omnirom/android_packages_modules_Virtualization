@@ -19,7 +19,8 @@ use crate::crosvm::VmMetric;
 use crate::get_calling_uid;
 use android_system_virtualizationcommon::aidl::android::system::virtualizationcommon::DeathReason::DeathReason;
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
-    CpuTopology::CpuTopology,
+    CpuOptions::CpuOptions,
+    CpuOptions::CpuTopology::CpuTopology,
     IVirtualMachine::IVirtualMachine,
     VirtualMachineAppConfig::{Payload::Payload, VirtualMachineAppConfig},
     VirtualMachineConfig::VirtualMachineConfig,
@@ -92,6 +93,18 @@ pub(crate) fn get_num_cpus() -> Option<usize> {
     }
 }
 
+fn get_num_vcpus(cpu_options: &CpuOptions) -> i32 {
+    match cpu_options.cpuTopology {
+        CpuTopology::MatchHost(_) => {
+            get_num_cpus().and_then(|v| v.try_into().ok()).unwrap_or_else(|| {
+                warn!("Failed to determine the number of CPUs in the host");
+                INVALID_NUM_CPUS
+            })
+        }
+        CpuTopology::CpuCount(count) => count,
+    }
+}
+
 /// Write the stats of VMCreation to statsd
 /// The function creates a separate thread which waits for statsd to start to push atom
 pub fn write_vm_creation_stats(
@@ -115,31 +128,22 @@ pub fn write_vm_creation_stats(
             binder_exception_code = e.exception_code() as i32;
         }
     }
-    let (vm_identifier, config_type, cpu_topology, memory_mib, apexes) = match config {
+
+    let (vm_identifier, config_type, num_cpus, memory_mib, apexes) = match config {
         VirtualMachineConfig::AppConfig(config) => (
             config.name.clone(),
             vm_creation_requested::ConfigType::VirtualMachineAppConfig,
-            config.cpuTopology,
+            get_num_vcpus(&config.cpuOptions),
             config.memoryMib,
             get_apex_list(config),
         ),
         VirtualMachineConfig::RawConfig(config) => (
             config.name.clone(),
             vm_creation_requested::ConfigType::VirtualMachineRawConfig,
-            config.cpuTopology,
+            get_num_vcpus(&config.cpuOptions),
             config.memoryMib,
             String::new(),
         ),
-    };
-
-    let num_cpus: i32 = match cpu_topology {
-        CpuTopology::MATCH_HOST => {
-            get_num_cpus().and_then(|v| v.try_into().ok()).unwrap_or_else(|| {
-                warn!("Failed to determine the number of CPUs in the host");
-                INVALID_NUM_CPUS
-            })
-        }
-        _ => 1,
     };
 
     let atom = AtomVmCreationRequested {

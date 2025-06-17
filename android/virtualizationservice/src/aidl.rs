@@ -196,6 +196,28 @@ impl VirtualizationServiceInternal {
 
         service
     }
+
+    // Attempt to update the sk_state maintenance database. Errors are ignored - calling app
+    // can not really do much to fix the errors & letting AVF VMs run irrespective of such internal
+    // error is acceptable.
+    fn try_updating_sk_state(&self, id: &[u8; 64]) {
+        let state = &mut *self.state.lock().unwrap();
+        if let Some(sk_state) = &mut state.sk_state {
+            let uid = get_calling_uid();
+            let user_id = multiuser_get_user_id(uid);
+            let app_id = multiuser_get_app_id(uid);
+            info!(
+                "Recording possible new owner of Secretkeeper entry={:?}:
+                 (user_id={user_id}, app_id={app_id},)",
+                hex::encode(id)
+            );
+            if let Err(e) = sk_state.add_id(id, user_id, app_id) {
+                error!("Failed to update the Secretkeeper entry owner: {e:?}");
+            }
+        } else {
+            info!("ignoring update of Secretkeeper entry as no ISecretkeeper");
+        }
+    }
 }
 
 impl Interface for VirtualizationServiceInternal {}
@@ -251,6 +273,7 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
 
     fn allocateGlobalVmContext(
         &self,
+        name: &str,
         requester_debug_pid: i32,
     ) -> binder::Result<Strong<dyn IGlobalVmContext>> {
         check_manage_access()?;
@@ -259,7 +282,7 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
         let requester_debug_pid = requester_debug_pid as pid_t;
         let state = &mut *self.state.lock().unwrap();
         state
-            .allocate_vm_context(requester_uid, requester_debug_pid)
+            .allocate_vm_context(name, requester_uid, requester_debug_pid)
             .or_binder_exception(ExceptionCode::ILLEGAL_STATE)
     }
 
@@ -289,6 +312,7 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
             .map(|vm| {
                 let vm = vm.lock().unwrap();
                 VirtualMachineDebugInfo {
+                    name: vm.name.clone(),
                     cid: vm.cid as i32,
                     temporaryDirectory: vm.get_temp_dir().to_string_lossy().to_string(),
                     requesterUid: vm.requester_uid as i32,
@@ -412,8 +436,12 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
     }
 
     fn isRemoteAttestationSupported(&self) -> binder::Result<bool> {
-        Ok(is_remote_provisioning_hal_declared()?
-            && remote_provisioning::is_remote_attestation_supported())
+        if is_remote_provisioning_hal_declared()? {
+            Ok(remote_provisioning::is_remote_attestation_supported())
+        } else {
+            warn!("AVF IRemotelyProvisionedComponent HAL is not declared");
+            Ok(false)
+        }
     }
 
     fn getAssignableDevices(&self) -> binder::Result<Vec<AssignableDevice>> {
@@ -461,18 +489,12 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
         id.try_fill(&mut rand::thread_rng())
             .context("Failed to allocate instance_id")
             .or_service_specific_exception(-1)?;
+        // Randomly allocated IDs always start with all 7s to avoid colliding with statically
+        // assigned IDs.
+        id[..4].fill(0x77);
         let uid = get_calling_uid();
         info!("Allocated a VM's instance_id: {:?}..., for uid: {:?}", &hex::encode(id)[..8], uid);
-        let state = &mut *self.state.lock().unwrap();
-        if let Some(sk_state) = &mut state.sk_state {
-            let user_id = multiuser_get_user_id(uid);
-            let app_id = multiuser_get_app_id(uid);
-            info!("Recording possible existence of state for (user_id={user_id}, app_id={app_id})");
-            if let Err(e) = sk_state.add_id(&id, user_id, app_id) {
-                error!("Failed to record the instance_id: {e:?}");
-            }
-        }
-
+        self.try_updating_sk_state(&id);
         Ok(id)
     }
 
@@ -496,24 +518,8 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
     }
 
     fn claimVmInstance(&self, instance_id: &[u8; 64]) -> binder::Result<()> {
-        let state = &mut *self.state.lock().unwrap();
-        if let Some(sk_state) = &mut state.sk_state {
-            let uid = get_calling_uid();
-            info!(
-                "Claiming a VM's instance_id: {:?}, for uid: {:?}",
-                hex::encode(instance_id),
-                uid
-            );
-
-            let user_id = multiuser_get_user_id(uid);
-            let app_id = multiuser_get_app_id(uid);
-            info!("Recording possible new owner of state for (user_id={user_id}, app_id={app_id})");
-            if let Err(e) = sk_state.add_id(instance_id, user_id, app_id) {
-                error!("Failed to update the instance_id owner: {e:?}");
-            }
-        } else {
-            info!("ignoring claimVmInstance() as no ISecretkeeper");
-        }
+        info!("Claiming a VM's instance_id: {:?}", hex::encode(instance_id));
+        self.try_updating_sk_state(instance_id);
         Ok(())
     }
 
@@ -554,6 +560,12 @@ impl IVirtualizationServiceInternal for VirtualizationServiceInternal {
         TETHERING_SERVICE.disableVmTethering()?;
 
         NETWORK_SERVICE.deleteTapInterface(tap_fd)
+    }
+
+    fn claimSecretkeeperEntry(&self, id: &[u8; 64]) -> binder::Result<()> {
+        info!("Claiming Secretkeeper entry: {:?}", hex::encode(id));
+        self.try_updating_sk_state(id);
+        Ok(())
     }
 }
 
@@ -658,6 +670,8 @@ fn split_x509_certificate_chain(mut cert_chain: &[u8]) -> Result<Vec<Certificate
 
 #[derive(Debug, Default)]
 struct GlobalVmInstance {
+    /// Name of the VM
+    name: String,
     /// The unique CID assigned to the VM for vsock communication.
     cid: Cid,
     /// UID of the client who requested this VM instance.
@@ -753,6 +767,7 @@ impl GlobalState {
 
     fn allocate_vm_context(
         &mut self,
+        name: &str,
         requester_uid: uid_t,
         requester_debug_pid: pid_t,
     ) -> Result<Strong<dyn IGlobalVmContext>> {
@@ -761,6 +776,7 @@ impl GlobalState {
 
         let cid = self.get_next_available_cid()?;
         let instance = Arc::new(Mutex::new(GlobalVmInstance {
+            name: name.to_owned(),
             cid,
             requester_uid,
             requester_debug_pid,

@@ -22,12 +22,9 @@ pub mod arch;
 pub mod bionic;
 pub mod console;
 mod entry;
-pub mod exceptions;
 pub mod fdt;
 pub mod heap;
-mod hvc;
 pub mod layout;
-pub mod linker;
 pub mod logger;
 pub mod memory;
 pub mod power;
@@ -35,12 +32,3 @@ pub mod rand;
 pub mod uart;
 pub mod util;
 pub mod virtio;
-
-use core::panic::PanicInfo;
-use power::reboot;
-
-#[panic_handler]
-fn panic(info: &PanicInfo) -> ! {
-    eprintln!("{}", info);
-    reboot()
-}

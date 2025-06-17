@@ -27,6 +27,7 @@ use anyhow::{bail, Context, Result};
 use apkverify::{HashAlgorithm, V4Signature};
 use clap::{arg, Arg, ArgAction, Command};
 use dm::loopdevice;
+use dm::loopdevice::LoopConfigOptions;
 use dm::util;
 use dm::verity::{DmVerityHashAlgorithm, DmVerityTargetBuilder};
 use itertools::Itertools;
@@ -109,9 +110,13 @@ fn enable_verity<P: AsRef<Path> + Debug>(
         }
         (
             loopdevice::attach(
-                &apk, 0, apk_size, /* direct_io */ true, /* writable */ false,
+                &apk,
+                0,
+                apk_size,
+                &LoopConfigOptions { direct_io: true, ..Default::default() },
             )
-            .context("Failed to attach APK to a loop device")?,
+            .context("Failed to attach APK to a loop device")?
+            .path,
             apk_size,
         )
     };
@@ -125,10 +130,9 @@ fn enable_verity<P: AsRef<Path> + Debug>(
     // Due to unknown reason(b/191344832), we can't enable "direct IO" for the IDSIG file (backing
     // the hash). For now we don't use "direct IO" but it seems OK since the IDSIG file is very
     // small and the benefit of direct-IO would be negliable.
-    let hash_device = loopdevice::attach(
-        &idsig, offset, size, /* direct_io */ false, /* writable */ false,
-    )
-    .context("Failed to attach idsig to a loop device")?;
+    let hash_device = loopdevice::attach(&idsig, offset, size, &LoopConfigOptions::default())
+        .context("Failed to attach idsig to a loop device")?
+        .path;
 
     // Build a dm-verity target spec from the information from the idsig file. The apk and the
     // idsig files are used as the data device and the hash device, respectively.
@@ -156,12 +160,8 @@ fn enable_verity<P: AsRef<Path> + Debug>(
 }
 
 #[cfg(test)]
-rdroidtest::test_main!();
-
-#[cfg(test)]
 mod tests {
     use crate::*;
-    use rdroidtest::{ignore_if, rdroidtest};
     use std::fs::{File, OpenOptions};
     use std::io::Write;
     use std::ops::Deref;
@@ -232,9 +232,11 @@ mod tests {
         });
     }
 
-    #[rdroidtest]
-    #[ignore_if(should_skip())]
+    #[test]
     fn correct_inputs() {
+        if should_skip() {
+            return;
+        }
         let apk = include_bytes!("../testdata/test.apk");
         let idsig = include_bytes!("../testdata/test.apk.idsig");
         run_test(apk.as_ref(), idsig.as_ref(), "correct", |ctx| {
@@ -246,9 +248,11 @@ mod tests {
     }
 
     // A single byte change in the APK file causes an IO error
-    #[rdroidtest]
-    #[ignore_if(should_skip())]
+    #[test]
     fn incorrect_apk() {
+        if should_skip() {
+            return;
+        }
         let apk = include_bytes!("../testdata/test.apk");
         let idsig = include_bytes!("../testdata/test.apk.idsig");
 
@@ -264,9 +268,11 @@ mod tests {
     }
 
     // A single byte change in the merkle tree also causes an IO error
-    #[rdroidtest]
-    #[ignore_if(should_skip())]
+    #[test]
     fn incorrect_merkle_tree() {
+        if should_skip() {
+            return;
+        }
         let apk = include_bytes!("../testdata/test.apk");
         let idsig = include_bytes!("../testdata/test.apk.idsig");
 
@@ -289,9 +295,11 @@ mod tests {
     // APK is not altered when the verity device is created, but later modified. IO error should
     // occur when trying to read the data around the modified location. This is the main scenario
     // that we'd like to protect.
-    #[rdroidtest]
-    #[ignore_if(should_skip())]
+    #[test]
     fn tampered_apk() {
+        if should_skip() {
+            return;
+        }
         let apk = include_bytes!("../testdata/test.apk");
         let idsig = include_bytes!("../testdata/test.apk.idsig");
 
@@ -311,9 +319,11 @@ mod tests {
 
     // idsig file is not alread when the verity device is created, but later modified. Unlike to
     // the APK case, this doesn't occur IO error because the merkle tree is already cached.
-    #[rdroidtest]
-    #[ignore_if(should_skip())]
+    #[test]
     fn tampered_idsig() {
+        if should_skip() {
+            return;
+        }
         let apk = include_bytes!("../testdata/test.apk");
         let idsig = include_bytes!("../testdata/test.apk.idsig");
         run_test(apk.as_ref(), idsig.as_ref(), "tampered_idsig", |ctx| {
@@ -329,9 +339,11 @@ mod tests {
     }
 
     // test if both files are already block devices
-    #[rdroidtest]
-    #[ignore_if(should_skip())]
+    #[test]
     fn inputs_are_block_devices() {
+        if should_skip() {
+            return;
+        }
         let apk = include_bytes!("../testdata/test.apk");
         let idsig = include_bytes!("../testdata/test.apk.idsig");
 
@@ -347,18 +359,17 @@ mod tests {
         // of the data device is done in the scopeguard for the return value of `enable_verity`
         // below. Only the idsig_loop_device needs detatching.
         let apk_loop_device = loopdevice::attach(
-            &apk_path, 0, apk_size, /* direct_io */ true, /* writable */ false,
+            &apk_path,
+            0,
+            apk_size,
+            &LoopConfigOptions { direct_io: true, ..Default::default() },
         )
-        .unwrap();
+        .unwrap()
+        .path;
         let idsig_loop_device = scopeguard::guard(
-            loopdevice::attach(
-                &idsig_path,
-                0,
-                idsig_size,
-                /* direct_io */ false,
-                /* writable */ false,
-            )
-            .unwrap(),
+            loopdevice::attach(&idsig_path, 0, idsig_size, &LoopConfigOptions::default())
+                .unwrap()
+                .path,
             |dev| loopdevice::detach(dev).unwrap(),
         );
 
@@ -380,9 +391,11 @@ mod tests {
     }
 
     // test with custom roothash
-    #[rdroidtest]
-    #[ignore_if(should_skip())]
+    #[test]
     fn correct_custom_roothash() {
+        if should_skip() {
+            return;
+        }
         let apk = include_bytes!("../testdata/test.apk");
         let idsig = include_bytes!("../testdata/test.apk.idsig");
         let roothash = V4Signature::from_idsig_path("testdata/test.apk.idsig")
@@ -403,7 +416,7 @@ mod tests {
         );
     }
 
-    #[rdroidtest]
+    #[test]
     fn verify_command() {
         // Check that the command parsing has been configured in a valid way.
         clap_command().debug_assert();

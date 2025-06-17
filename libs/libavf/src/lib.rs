@@ -16,19 +16,24 @@
 
 use std::ffi::CStr;
 use std::fs::File;
-use std::os::fd::FromRawFd;
+use std::os::fd::{FromRawFd, IntoRawFd};
 use std::os::raw::{c_char, c_int};
 use std::ptr;
+use std::time::Duration;
 
 use android_system_virtualizationservice::{
     aidl::android::system::virtualizationservice::{
+        AssignedDevices::AssignedDevices, CpuOptions::CpuOptions,
+        CpuOptions::CpuTopology::CpuTopology, CustomMemoryBackingFile::CustomMemoryBackingFile,
         DiskImage::DiskImage, IVirtualizationService::IVirtualizationService,
         VirtualMachineConfig::VirtualMachineConfig,
         VirtualMachineRawConfig::VirtualMachineRawConfig,
     },
     binder::{ParcelFileDescriptor, Strong},
 };
-use avf_bindgen::StopReason;
+use avf_bindgen::AVirtualMachineStopReason;
+use libc::timespec;
+use log::error;
 use vmclient::{DeathReason, VirtualizationService, VmInstance};
 
 /// Create a new virtual machine config object with no properties.
@@ -70,8 +75,14 @@ pub unsafe extern "C" fn AVirtualMachineRawConfig_setName(
     // AVirtualMachineRawConfig_create. It's the only reference to the object.
     let config = unsafe { &mut *config };
     // SAFETY: `name` is assumed to be a pointer to a valid C string.
-    config.name = unsafe { CStr::from_ptr(name) }.to_string_lossy().into_owned();
-    0
+    let name = unsafe { CStr::from_ptr(name) };
+    match name.to_str() {
+        Ok(name) => {
+            config.name = name.to_owned();
+            0
+        }
+        Err(_) => -libc::EINVAL,
+    }
 }
 
 /// Set an instance ID of a virtual machine.
@@ -83,7 +94,12 @@ pub unsafe extern "C" fn AVirtualMachineRawConfig_setName(
 pub unsafe extern "C" fn AVirtualMachineRawConfig_setInstanceId(
     config: *mut VirtualMachineRawConfig,
     instance_id: *const u8,
+    instance_id_size: usize,
 ) -> c_int {
+    if instance_id_size != 64 {
+        return -libc::EINVAL;
+    }
+
     // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
     // AVirtualMachineRawConfig_create. It's the only reference to the object.
     let config = unsafe { &mut *config };
@@ -91,7 +107,7 @@ pub unsafe extern "C" fn AVirtualMachineRawConfig_setInstanceId(
     // is assumed to be a valid object returned by AVirtuaMachineConfig_create.
     // Both never overlap.
     unsafe {
-        ptr::copy_nonoverlapping(instance_id, config.instanceId.as_mut_ptr(), 64);
+        ptr::copy_nonoverlapping(instance_id, config.instanceId.as_mut_ptr(), instance_id_size);
     }
     0
 }
@@ -106,13 +122,12 @@ pub unsafe extern "C" fn AVirtualMachineRawConfig_setInstanceId(
 pub unsafe extern "C" fn AVirtualMachineRawConfig_setKernel(
     config: *mut VirtualMachineRawConfig,
     fd: c_int,
-) -> c_int {
+) {
     let file = get_file_from_fd(fd);
     // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
     // AVirtualMachineRawConfig_create. It's the only reference to the object.
     let config = unsafe { &mut *config };
     config.kernel = file.map(ParcelFileDescriptor::new);
-    0
 }
 
 /// Set an init rd of a virtual machine.
@@ -125,13 +140,12 @@ pub unsafe extern "C" fn AVirtualMachineRawConfig_setKernel(
 pub unsafe extern "C" fn AVirtualMachineRawConfig_setInitRd(
     config: *mut VirtualMachineRawConfig,
     fd: c_int,
-) -> c_int {
+) {
     let file = get_file_from_fd(fd);
     // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
     // AVirtualMachineRawConfig_create. It's the only reference to the object.
     let config = unsafe { &mut *config };
     config.initrd = file.map(ParcelFileDescriptor::new);
-    0
 }
 
 /// Add a disk for a virtual machine.
@@ -169,15 +183,44 @@ pub unsafe extern "C" fn AVirtualMachineRawConfig_addDisk(
 /// # Safety
 /// `config` must be a pointer returned by `AVirtualMachineRawConfig_create`.
 #[no_mangle]
-pub unsafe extern "C" fn AVirtualMachineRawConfig_setMemoryMib(
+pub unsafe extern "C" fn AVirtualMachineRawConfig_setMemoryMiB(
     config: *mut VirtualMachineRawConfig,
     memory_mib: i32,
-) -> c_int {
+) {
     // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
     // AVirtualMachineRawConfig_create. It's the only reference to the object.
     let config = unsafe { &mut *config };
     config.memoryMib = memory_mib;
-    0
+}
+
+/// Set how much swiotlb will be given to a virtual machine.
+///
+/// # Safety
+/// `config` must be a pointer returned by `AVirtualMachineRawConfig_create`.
+#[no_mangle]
+pub unsafe extern "C" fn AVirtualMachineRawConfig_setSwiotlbMiB(
+    config: *mut VirtualMachineRawConfig,
+    swiotlb_mib: i32,
+) {
+    // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
+    // AVirtualMachineRawConfig_create. It's the only reference to the object.
+    let config = unsafe { &mut *config };
+    config.swiotlbMib = swiotlb_mib;
+}
+
+/// Set vCPU count.
+///
+/// # Safety
+/// `config` must be a pointer returned by `AVirtualMachineRawConfig_create`.
+#[no_mangle]
+pub unsafe extern "C" fn AVirtualMachineRawConfig_setVCpuCount(
+    config: *mut VirtualMachineRawConfig,
+    n: i32,
+) {
+    // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
+    // AVirtualMachineRawConfig_create. It's the only reference to the object.
+    let config = unsafe { &mut *config };
+    config.cpuOptions = CpuOptions { cpuTopology: CpuTopology::CpuCount(n) };
 }
 
 /// Set whether a virtual machine is protected or not.
@@ -188,54 +231,85 @@ pub unsafe extern "C" fn AVirtualMachineRawConfig_setMemoryMib(
 pub unsafe extern "C" fn AVirtualMachineRawConfig_setProtectedVm(
     config: *mut VirtualMachineRawConfig,
     protected_vm: bool,
-) -> c_int {
+) {
     // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
     // AVirtualMachineRawConfig_create. It's the only reference to the object.
     let config = unsafe { &mut *config };
     config.protectedVm = protected_vm;
-    0
 }
 
-/// Set whether a virtual machine uses memory ballooning or not.
+/// Set whether to use an alternate, hypervisor-specific authentication method for protected VMs.
 ///
 /// # Safety
 /// `config` must be a pointer returned by `AVirtualMachineRawConfig_create`.
 #[no_mangle]
-pub unsafe extern "C" fn AVirtualMachineRawConfig_setBalloon(
+pub unsafe extern "C" fn AVirtualMachineRawConfig_setHypervisorSpecificAuthMethod(
     config: *mut VirtualMachineRawConfig,
-    balloon: bool,
+    enable: bool,
 ) -> c_int {
     // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
     // AVirtualMachineRawConfig_create. It's the only reference to the object.
     let config = unsafe { &mut *config };
-    config.noBalloon = !balloon;
+    config.enableHypervisorSpecificAuthMethod = enable;
+    // We don't validate whether this is supported until later, when the VM is started.
     0
 }
 
-/// NOT IMPLEMENTED.
+/// Use the specified fd as the backing memfd for a range of the guest physical memory.
 ///
-/// # Returns
-/// It always returns `-ENOTSUP`.
+/// # Safety
+/// `config` must be a pointer returned by `AVirtualMachineRawConfig_create`.
 #[no_mangle]
-pub extern "C" fn AVirtualMachineRawConfig_setHypervisorSpecificAuthMethod(
-    _config: *mut VirtualMachineRawConfig,
-    _enable: bool,
+pub unsafe extern "C" fn AVirtualMachineRawConfig_addCustomMemoryBackingFile(
+    config: *mut VirtualMachineRawConfig,
+    fd: c_int,
+    range_start: u64,
+    range_end: u64,
 ) -> c_int {
-    -libc::ENOTSUP
+    // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
+    // AVirtualMachineRawConfig_create. It's the only reference to the object.
+    let config = unsafe { &mut *config };
+
+    let Some(file) = get_file_from_fd(fd) else {
+        return -libc::EINVAL;
+    };
+    let Some(size) = range_end.checked_sub(range_start) else {
+        return -libc::EINVAL;
+    };
+    config.customMemoryBackingFiles.push(CustomMemoryBackingFile {
+        file: Some(ParcelFileDescriptor::new(file)),
+        // AIDL doesn't support unsigned ints, so we've got to reinterpret the bytes into a signed
+        // int.
+        rangeStart: range_start as i64,
+        size: size as i64,
+    });
+    0
 }
 
-/// NOT IMPLEMENTED.
+/// Add device tree overlay blob
 ///
-/// # Returns
-/// It always returns `-ENOTSUP`.
+/// # Safety
+/// `config` must be a pointer returned by `AVirtualMachineRawConfig_create`. `fd` must be a valid
+/// file descriptor or -1. `AVirtualMachineRawConfig_setDeviceTreeOverlay` takes ownership of `fd`
+/// and `fd` will be closed upon `AVirtualMachineRawConfig_delete`.
 #[no_mangle]
-pub extern "C" fn AVirtualMachineRawConfig_addCustomMemoryBackingFile(
-    _config: *mut VirtualMachineRawConfig,
-    _fd: c_int,
-    _range_start: usize,
-    _range_end: usize,
-) -> c_int {
-    -libc::ENOTSUP
+pub unsafe extern "C" fn AVirtualMachineRawConfig_setDeviceTreeOverlay(
+    config: *mut VirtualMachineRawConfig,
+    fd: c_int,
+) {
+    // SAFETY: `config` is assumed to be a valid, non-null pointer returned by
+    // AVirtualMachineRawConfig_create. It's the only reference to the object.
+    let config = unsafe { &mut *config };
+
+    match get_file_from_fd(fd) {
+        Some(file) => {
+            let fd = ParcelFileDescriptor::new(file);
+            config.devices = AssignedDevices::Dtbo(Some(fd));
+        }
+        _ => {
+            config.devices = Default::default();
+        }
+    };
 }
 
 /// Spawn a new instance of `virtmgr`, a child process that will host the `VirtualizationService`
@@ -317,7 +391,7 @@ pub unsafe extern "C" fn AVirtualMachine_createRaw(
     let console_in = get_file_from_fd(console_in_fd);
     let log = get_file_from_fd(log_fd);
 
-    match VmInstance::create(service.as_ref(), &config, console_out, console_in, log, None, None) {
+    match VmInstance::create(service.as_ref(), &config, console_out, console_in, log, None) {
         Ok(vm) => {
             // SAFETY: `vm_ptr` is assumed to be a valid, non-null pointer to a mutable raw pointer.
             // `vm` is the only reference here and `vm_ptr` takes ownership.
@@ -326,7 +400,10 @@ pub unsafe extern "C" fn AVirtualMachine_createRaw(
             }
             0
         }
-        Err(_) => -libc::EIO,
+        Err(e) => {
+            error!("AVirtualMachine_createRaw failed: {e:?}");
+            -libc::EIO
+        }
     }
 }
 
@@ -339,9 +416,12 @@ pub unsafe extern "C" fn AVirtualMachine_start(vm: *const VmInstance) -> c_int {
     // SAFETY: `vm` is assumed to be a valid, non-null pointer returned by
     // `AVirtualMachine_createRaw`. It's the only reference to the object.
     let vm = unsafe { &*vm };
-    match vm.start() {
+    match vm.start(None) {
         Ok(_) => 0,
-        Err(_) => -libc::EIO,
+        Err(e) => {
+            error!("AVirtualMachine_start failed: {e:?}");
+            -libc::EIO
+        }
     }
 }
 
@@ -356,35 +436,89 @@ pub unsafe extern "C" fn AVirtualMachine_stop(vm: *const VmInstance) -> c_int {
     let vm = unsafe { &*vm };
     match vm.stop() {
         Ok(_) => 0,
-        Err(_) => -libc::EIO,
+        Err(e) => {
+            error!("AVirtualMachine_stop failed: {e:?}");
+            -libc::EIO
+        }
     }
 }
 
-/// Wait until a virtual machine stops.
+/// Open a vsock connection to the CID of the virtual machine on the given vsock port.
 ///
 /// # Safety
-/// `vm` must be a pointer returned by `AVirtualMachine_createRaw`.
+/// `vm` must be a pointer returned by `AVirtualMachine_create`.
 #[no_mangle]
-pub unsafe extern "C" fn AVirtualMachine_waitForStop(vm: *const VmInstance) -> StopReason {
+pub unsafe extern "C" fn AVirtualMachine_connectVsock(vm: *const VmInstance, port: u32) -> c_int {
+    // SAFETY: `vm` is assumed to be a valid, non-null pointer returned by
+    // `AVirtualMachine_createRaw`. It's the only reference to the object.
+    let vm = unsafe { &*vm };
+    match vm.connect_vsock(port) {
+        Ok(pfd) => pfd.into_raw_fd(),
+        Err(e) => {
+            error!("AVirtualMachine_connectVsock failed: {e:?}");
+            -libc::EIO
+        }
+    }
+}
+
+fn death_reason_to_stop_reason(death_reason: DeathReason) -> AVirtualMachineStopReason {
+    match death_reason {
+        DeathReason::VirtualizationServiceDied => {
+            AVirtualMachineStopReason::AVIRTUAL_MACHINE_VIRTUALIZATION_SERVICE_DIED
+        }
+        DeathReason::InfrastructureError => {
+            AVirtualMachineStopReason::AVIRTUAL_MACHINE_INFRASTRUCTURE_ERROR
+        }
+        DeathReason::Killed => AVirtualMachineStopReason::AVIRTUAL_MACHINE_KILLED,
+        DeathReason::Unknown => AVirtualMachineStopReason::AVIRTUAL_MACHINE_UNKNOWN,
+        DeathReason::Shutdown => AVirtualMachineStopReason::AVIRTUAL_MACHINE_SHUTDOWN,
+        DeathReason::StartFailed => AVirtualMachineStopReason::AVIRTUAL_MACHINE_START_FAILED,
+        DeathReason::Reboot => AVirtualMachineStopReason::AVIRTUAL_MACHINE_REBOOT,
+        DeathReason::Crash => AVirtualMachineStopReason::AVIRTUAL_MACHINE_CRASH,
+        DeathReason::PvmFirmwarePublicKeyMismatch => {
+            AVirtualMachineStopReason::AVIRTUAL_MACHINE_PVM_FIRMWARE_PUBLIC_KEY_MISMATCH
+        }
+        DeathReason::PvmFirmwareInstanceImageChanged => {
+            AVirtualMachineStopReason::AVIRTUAL_MACHINE_PVM_FIRMWARE_INSTANCE_IMAGE_CHANGED
+        }
+        DeathReason::Hangup => AVirtualMachineStopReason::AVIRTUAL_MACHINE_HANGUP,
+        _ => AVirtualMachineStopReason::AVIRTUAL_MACHINE_UNRECOGNISED,
+    }
+}
+
+/// Wait until a virtual machine stops or the timeout elapses.
+///
+/// # Safety
+/// `vm` must be a pointer returned by `AVirtualMachine_createRaw`. `timeout` must be a valid
+/// pointer to a `struct timespec` object or null. `reason` must be a valid, non-null pointer to an
+/// AVirtualMachineStopReason object.
+#[no_mangle]
+pub unsafe extern "C" fn AVirtualMachine_waitForStop(
+    vm: *const VmInstance,
+    timeout: *const timespec,
+    reason: *mut AVirtualMachineStopReason,
+) -> bool {
     // SAFETY: `vm` is assumed to be a valid, non-null pointer returned by
     // AVirtualMachine_create. It's the only reference to the object.
     let vm = unsafe { &*vm };
-    match vm.wait_for_death() {
-        DeathReason::VirtualizationServiceDied => StopReason::VIRTUALIZATION_SERVICE_DIED,
-        DeathReason::InfrastructureError => StopReason::INFRASTRUCTURE_ERROR,
-        DeathReason::Killed => StopReason::KILLED,
-        DeathReason::Unknown => StopReason::UNKNOWN,
-        DeathReason::Shutdown => StopReason::SHUTDOWN,
-        DeathReason::StartFailed => StopReason::START_FAILED,
-        DeathReason::Reboot => StopReason::REBOOT,
-        DeathReason::Crash => StopReason::CRASH,
-        DeathReason::PvmFirmwarePublicKeyMismatch => StopReason::PVM_FIRMWARE_PUBLIC_KEY_MISMATCH,
-        DeathReason::PvmFirmwareInstanceImageChanged => {
-            StopReason::PVM_FIRMWARE_INSTANCE_IMAGE_CHANGED
+
+    let death_reason = if timeout.is_null() {
+        vm.wait_for_death()
+    } else {
+        // SAFETY: `timeout` is assumed to be a valid pointer to a `struct timespec` object if
+        // non-null.
+        let timeout = unsafe { &*timeout };
+        let timeout = Duration::new(timeout.tv_sec as u64, timeout.tv_nsec as u32);
+        match vm.wait_for_death_with_timeout(timeout) {
+            Some(death_reason) => death_reason,
+            None => return false,
         }
-        DeathReason::Hangup => StopReason::HANGUP,
-        _ => StopReason::UNRECOGNISED,
-    }
+    };
+
+    // SAFETY: `reason` is assumed to be a valid, non-null pointer to an
+    // AVirtualMachineStopReason object.
+    unsafe { *reason = death_reason_to_stop_reason(death_reason) };
+    true
 }
 
 /// Destroy a virtual machine.

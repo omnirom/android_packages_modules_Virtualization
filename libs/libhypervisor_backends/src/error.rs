@@ -16,7 +16,12 @@
 
 use core::{fmt, result};
 
-use super::hypervisor::{GeniezoneError, KvmError};
+#[cfg(target_arch = "aarch64")]
+use super::hypervisor::GeniezoneError;
+#[cfg(target_arch = "aarch64")]
+use super::hypervisor::GunyahError;
+use super::hypervisor::KvmError;
+#[cfg(target_arch = "aarch64")]
 use uuid::Uuid;
 
 /// Result type with hypervisor error.
@@ -29,10 +34,18 @@ pub enum Error {
     MmioGuardNotSupported,
     /// Failed to invoke a certain KVM HVC function.
     KvmError(KvmError, u32),
+    #[cfg(target_arch = "aarch64")]
     /// Failed to invoke GenieZone HVC function.
     GeniezoneError(GeniezoneError, u32),
+    #[cfg(target_arch = "aarch64")]
     /// Unsupported Hypervisor
     UnsupportedHypervisorUuid(Uuid),
+    #[cfg(target_arch = "x86_64")]
+    /// Unsupported x86_64 Hypervisor
+    UnsupportedHypervisor(u128),
+    #[cfg(target_arch = "aarch64")]
+    /// Failed to invoke Gunyah HVC.
+    GunyahError(GunyahError),
 }
 
 impl fmt::Display for Error {
@@ -42,14 +55,24 @@ impl fmt::Display for Error {
             Self::KvmError(e, function_id) => {
                 write!(f, "Failed to invoke the HVC function with function ID {function_id}: {e}")
             }
+            #[cfg(target_arch = "aarch64")]
             Self::GeniezoneError(e, function_id) => {
                 write!(
                     f,
                     "Failed to invoke GenieZone HVC function with function ID {function_id}: {e}"
                 )
             }
+            #[cfg(target_arch = "aarch64")]
+            Self::GunyahError(e) => {
+                write!(f, "Failed to invoke Gunyah HVC: {e}")
+            }
+            #[cfg(target_arch = "aarch64")]
             Self::UnsupportedHypervisorUuid(u) => {
                 write!(f, "Unsupported Hypervisor UUID {u}")
+            }
+            #[cfg(target_arch = "x86_64")]
+            Self::UnsupportedHypervisor(c) => {
+                write!(f, "Unsupported x86_64 Hypervisor {c}")
             }
         }
     }

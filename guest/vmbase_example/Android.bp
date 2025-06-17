@@ -8,14 +8,20 @@ rust_ffi_static {
     crate_name: "vmbase_example",
     srcs: ["src/main.rs"],
     rustlibs: [
-        "libaarch64_paging",
-        "libcstr",
         "libdiced_open_dice_nostd",
         "liblibfdt_nostd",
         "liblog_rust_nostd",
+        "libspin_nostd",
         "libvirtio_drivers",
         "libvmbase",
     ],
+    target: {
+        android_arm64: {
+            rustlibs: [
+                "libaarch64_paging",
+            ],
+        },
+    },
 }
 
 genrule {
@@ -40,6 +46,9 @@ cc_defaults {
         "-E",
         "-P",
         "-xassembler-with-cpp", // allow C preprocessor directives
+        // Soong passes an implicit -c before -E. Suppress the warning about -c
+        // being unused.
+        "-Wno-unused-command-line-argument",
     ],
     srcs: [":vmbase_image.ld.S.mm"],
     visibility: ["//visibility:private"],

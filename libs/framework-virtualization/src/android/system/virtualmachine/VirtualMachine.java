@@ -276,41 +276,19 @@ public class VirtualMachine implements AutoCloseable {
 
         @Override
         public void onTrimMemory(int level) {
-            int percent;
+            /* Treat level < TRIM_MEMORY_UI_HIDDEN as generic low-memory warnings */
+            int percent = 10;
 
-            switch (level) {
-                case ComponentCallbacks2.TRIM_MEMORY_RUNNING_CRITICAL:
-                    percent = 50;
-                    break;
-                case ComponentCallbacks2.TRIM_MEMORY_RUNNING_LOW:
-                    percent = 30;
-                    break;
-                case ComponentCallbacks2.TRIM_MEMORY_RUNNING_MODERATE:
-                    percent = 10;
-                    break;
-                case ComponentCallbacks2.TRIM_MEMORY_BACKGROUND:
-                case ComponentCallbacks2.TRIM_MEMORY_MODERATE:
-                case ComponentCallbacks2.TRIM_MEMORY_COMPLETE:
-                    /* Release as much memory as we can. The app is on the LMKD LRU kill list. */
-                    percent = 50;
-                    break;
-                default:
-                    /* Treat unrecognised messages as generic low-memory warnings. */
-                    percent = 30;
-                    break;
+            if (level >= ComponentCallbacks2.TRIM_MEMORY_UI_HIDDEN) {
+                percent = 30;
             }
 
-            synchronized (mLock) {
-                try {
-                    if (mVirtualMachine != null) {
-                        long bytes = mConfig.getMemoryBytes();
-                        mVirtualMachine.setMemoryBalloon(bytes * percent / 100);
-                    }
-                } catch (Exception e) {
-                    /* Caller doesn't want our exceptions. Log them instead. */
-                    Log.w(TAG, "TrimMemory failed: ", e);
-                }
+            if (level >= ComponentCallbacks2.TRIM_MEMORY_BACKGROUND) {
+                /* Release as much memory as we can. The app is on the LMKD LRU kill list. */
+                percent = 50;
             }
+
+            setMemoryBalloonByPercent(percent);
         }
     }
 
@@ -780,7 +758,7 @@ public class VirtualMachine implements AutoCloseable {
             try {
                 status = stateToStatus(virtualMachine.getState());
             } catch (RemoteException e) {
-                throw e.rethrowAsRuntimeException();
+                status = STATUS_STOPPED;
             }
         }
         if (status == STATUS_STOPPED && !mVmRootPath.exists()) {
@@ -835,6 +813,10 @@ public class VirtualMachine implements AutoCloseable {
      */
     @GuardedBy("mLock")
     private void dropVm() {
+        if (mInputEventExecutor != null) {
+            mInputEventExecutor.shutdownNow();
+            mInputEventExecutor = null;
+        }
         if (mMemoryManagementCallbacks != null) {
             mContext.unregisterComponentCallbacks(mMemoryManagementCallbacks);
         }
@@ -1404,6 +1386,24 @@ public class VirtualMachine implements AutoCloseable {
         }
     }
 
+    /** @hide */
+    public void setMemoryBalloonByPercent(int percent) {
+        if (percent < 0 || percent > 100) {
+            Log.e(TAG, String.format("Invalid percent value: %d", percent));
+            return;
+        }
+        synchronized (mLock) {
+            try {
+                if (mVirtualMachine != null && mVirtualMachine.isMemoryBalloonEnabled()) {
+                    long bytes = mConfig.getMemoryBytes();
+                    mVirtualMachine.setMemoryBalloon(bytes * percent / 100);
+                }
+            } catch (RemoteException | ServiceSpecificException e) {
+                Log.w(TAG, "Cannot setMemoryBalloon", e);
+            }
+        }
+    }
+
     private boolean writeEventsToSock(ParcelFileDescriptor sock, List<InputEvent> evtList) {
         ByteBuffer byteBuffer =
                 ByteBuffer.allocate(8 /* (type: u16 + code: u16 + value: i32) */ * evtList.size());
@@ -1574,6 +1574,12 @@ public class VirtualMachine implements AutoCloseable {
                         vmConfig.getCustomImageConfig() != null
                                 ? createVirtualMachineConfigForRawFrom(vmConfig)
                                 : createVirtualMachineConfigForAppFrom(vmConfig, service);
+
+                if (vmConfig.isEncryptedStorageEnabled()) {
+                    service.setEncryptedStorageSize(
+                        ParcelFileDescriptor.open(mEncryptedStoreFilePath, MODE_READ_WRITE),
+                        vmConfig.getEncryptedStorageBytes());
+                }
 
                 mVirtualMachine =
                         service.createVm(
@@ -1805,7 +1811,7 @@ public class VirtualMachine implements AutoCloseable {
      * {@linkplain #connectToVsockServer binder request}, and wait for {@link
      * VirtualMachineCallback#onPayloadFinished} to be called.
      *
-     * <p>A stopped virtual machine can be re-started by calling {@link #run()}.
+     * <p>A stopped virtual machine cannot be re-started.
      *
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
@@ -1823,9 +1829,6 @@ public class VirtualMachine implements AutoCloseable {
             try {
                 mVirtualMachine.stop();
                 dropVm();
-                if (mInputEventExecutor != null) {
-                    mInputEventExecutor.shutdownNow();
-                }
             } catch (RemoteException e) {
                 throw e.rethrowAsRuntimeException();
             } catch (ServiceSpecificException e) {
@@ -1887,9 +1890,7 @@ public class VirtualMachine implements AutoCloseable {
                     mVirtualMachine.stop();
                     dropVm();
                 }
-            } catch (RemoteException e) {
-                throw e.rethrowAsRuntimeException();
-            } catch (ServiceSpecificException e) {
+            } catch (RemoteException | ServiceSpecificException e) {
                 // Deliberately ignored; this almost certainly means the VM exited just as
                 // we tried to stop it.
                 Log.i(TAG, "Ignoring error on close()", e);
@@ -1930,6 +1931,8 @@ public class VirtualMachine implements AutoCloseable {
      * <p>The new config must be {@linkplain VirtualMachineConfig#isCompatibleWith compatible with}
      * the existing config.
      *
+     * <p>NOTE: Modification of the encrypted storage size is restricted to expansion only and is an
+     * irreversible operation.
      * <p>NOTE: This method may block and should not be called on the main thread.
      *
      * @return the old config
@@ -1944,7 +1947,9 @@ public class VirtualMachine implements AutoCloseable {
             throws VirtualMachineException {
         synchronized (mLock) {
             VirtualMachineConfig oldConfig = mConfig;
-            if (!oldConfig.isCompatibleWith(newConfig)) {
+            if (!oldConfig.isCompatibleWith(newConfig)
+                    || oldConfig.getEncryptedStorageBytes()
+                            > newConfig.getEncryptedStorageBytes()) {
                 throw new VirtualMachineException("incompatible config");
             }
             checkStopped();
@@ -1960,8 +1965,52 @@ public class VirtualMachine implements AutoCloseable {
         }
     }
 
-    @Nullable
-    private static native IBinder nativeConnectToVsockServer(IBinder vmBinder, int port);
+    /**
+     * Abstracts away the task of creating a vsock connection. Normally, in the same process, you'll
+     * make the connection and then promote it to a binder as part of the same API call, but if you
+     * want to pass a connection to another process first, before establishing the RPC binder
+     * connection, you may implement this method by getting a vsock connection from another process.
+     *
+     * <p>It is recommended to convert other types of exceptions (e.g. remote exceptions) to
+     * VirtualMachineException, so that all connection failures will be visible under the same type
+     * of exception.
+     *
+     * @hide
+     */
+    @SystemApi
+    @SuppressLint("UnflaggedApi") // already existing functionality exposed, users should flag
+    public interface VsockConnectionProvider {
+        /**
+         * Returns a connection, either from {@link #connectVsock} or from
+         * the VM owner which would call {@link #connectVsock} on your behalf.
+         *
+         * <p>Each call should return a new connection.
+         */
+        @NonNull
+        @SuppressLint("UnflaggedApi") // already existing functionality exposed, users should flag
+        public ParcelFileDescriptor addConnection() throws VirtualMachineException;
+    }
+
+    /**
+     * Class to make it easy to use JNI, without needing PFD and other classes.
+     *
+     * @hide
+     */
+    private static class NativeProviderWrapper {
+        private VsockConnectionProvider mProvider = null;
+
+        // ensures last FD is owned until get is called again
+        private ParcelFileDescriptor mMoreLifetime = null;
+
+        public NativeProviderWrapper(VsockConnectionProvider provider) {
+            mProvider = provider;
+        }
+
+        int connect() throws VirtualMachineException {
+            mMoreLifetime = mProvider.addConnection();
+            return mMoreLifetime.getFileDescriptor().getInt$();
+        }
+    }
 
     /**
      * Connect to a VM's binder service via vsock and return the root IBinder object. Guest VMs are
@@ -1981,15 +2030,51 @@ public class VirtualMachine implements AutoCloseable {
     public IBinder connectToVsockServer(
             @IntRange(from = MIN_VSOCK_PORT, to = MAX_VSOCK_PORT) long port)
             throws VirtualMachineException {
+        VsockConnectionProvider provider =
+                new VsockConnectionProvider() {
+                    @Override
+                    public ParcelFileDescriptor addConnection() throws VirtualMachineException {
+                        return connectVsock(port);
+                    }
+                };
+        return binderFromPreconnectedClient(provider);
+    }
 
-        synchronized (mLock) {
-            IBinder iBinder =
-                    nativeConnectToVsockServer(getRunningVm().asBinder(), validatePort(port));
-            if (iBinder == null) {
-                throw new VirtualMachineException("Failed to connect to vsock server");
-            }
-            return iBinder;
+    @Nullable
+    private static native IBinder nativeBinderFromPreconnectedClient(
+            NativeProviderWrapper provider);
+
+    /**
+     * Convert existing vsock connection to a binder connection.
+     *
+     * <p>See {@linkplain #connectToVsockServer} for details. This method allows
+     * you to create the connects independently from upgrading them to the
+     * binder connection. Specifically:
+     *
+     * <p>connectToVsockServer = connectToVsock + binderFromPreconnectedClient
+     *
+     * <p>This method is useful if you want to pass the vsock connection to
+     * another process before establishing the RPC binder connection, so that
+     * you can create a direct connection.
+     *
+     * @args
+     *     provider: a provider that provides the vsock connection. This
+     *              provider should return connections from
+     *              {@link #connectVsock}, from the VM owner.
+     *
+     * @hide
+     */
+    @SystemApi
+    @SuppressLint("UnflaggedApi") // already existing functionality exposed, users should flag
+    @WorkerThread
+    @NonNull
+    public static IBinder binderFromPreconnectedClient(@NonNull VsockConnectionProvider provider)
+            throws VirtualMachineException {
+        IBinder binder = nativeBinderFromPreconnectedClient(new NativeProviderWrapper(provider));
+        if (binder == null) {
+            throw new VirtualMachineException("Failed to connect to vsock server");
         }
+        return binder;
     }
 
     /**

@@ -21,14 +21,17 @@ import static android.content.pm.PackageManager.FEATURE_VIRTUALIZATION_FRAMEWORK
 import static android.content.pm.PackageManager.FEATURE_WATCH;
 
 import static com.google.common.truth.Truth.assertThat;
+import static com.google.common.truth.Truth.assertWithMessage;
 import static com.google.common.truth.TruthJUnit.assume;
 
 import static org.junit.Assume.assumeFalse;
 import static org.junit.Assume.assumeTrue;
 
+import android.app.ActivityManager;
 import android.app.Instrumentation;
 import android.app.UiAutomation;
 import android.content.Context;
+import android.os.Build;
 import android.os.ParcelFileDescriptor;
 import android.os.SystemProperties;
 import android.system.Os;
@@ -55,9 +58,10 @@ import java.io.File;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.util.Arrays;
+import java.util.ArrayList;
 import java.util.Collections;
 import java.util.HashSet;
+import java.util.List;
 import java.util.OptionalLong;
 import java.util.Set;
 import java.util.concurrent.CompletableFuture;
@@ -70,13 +74,25 @@ public abstract class MicrodroidDeviceTestBase {
     private final String MAX_PERFORMANCE_TASK_PROFILE = "CPUSET_SP_TOP_APP";
 
     protected static final String KERNEL_VERSION = SystemProperties.get("ro.kernel.version");
+
+    private static final List<String> getSupportedOSes() {
+        List<String> ret = new ArrayList<>();
+        ret.add("microdroid");
+        if (Build.VERSION.SDK_INT >= 35) {
+            ret.add("microdroid_gki-android15-6.6");
+        }
+        if (Build.VERSION.SDK_INT >= 36) {
+            ret.add("microdroid_16k");
+        }
+        return ret;
+    }
+
     protected static final Set<String> SUPPORTED_OSES =
-            Collections.unmodifiableSet(
-                    new HashSet<>(
-                            Arrays.asList(
-                                    "microdroid",
-                                    "microdroid_16k",
-                                    "microdroid_gki-android15-6.6")));
+            Collections.unmodifiableSet(new HashSet<>(getSupportedOSes()));
+
+    private static final long ONE_MEBI = 1024 * 1024;
+    private static final long MIN_MEM_ARM64 = 170 * ONE_MEBI;
+    private static final long MIN_MEM_X86_64 = 196 * ONE_MEBI;
 
     public static boolean isCuttlefish() {
         return getDeviceProperties().isCuttlefish();
@@ -148,10 +164,12 @@ public abstract class MicrodroidDeviceTestBase {
     }
 
     public VirtualMachineConfig.Builder newVmConfigBuilderWithPayloadConfig(String configPath) {
-        return new VirtualMachineConfig.Builder(mCtx)
-                .setProtectedVm(mProtectedVm)
-                .setOs(os())
-                .setPayloadConfigPath(configPath);
+        VirtualMachineConfig.Builder builder = new VirtualMachineConfig.Builder(mCtx);
+        builder.setProtectedVm(mProtectedVm).setPayloadConfigPath(configPath);
+        if (Build.VERSION.SDK_INT >= 35) {
+            builder.setOs(os());
+        }
+        return builder;
     }
 
     public VirtualMachineConfig.Builder newVmConfigBuilderWithPayloadBinary(String binaryPath) {
@@ -206,9 +224,6 @@ public abstract class MicrodroidDeviceTestBase {
             assume().withMessage("Skip where protected VMs aren't supported")
                     .that(capabilities & VirtualMachineManager.CAPABILITY_PROTECTED_VM)
                     .isNotEqualTo(0);
-            assume().withMessage("Testing protected VMs on GSI isn't supported. b/272443823")
-                    .that(isGsi())
-                    .isFalse();
             // TODO(b/376870129): remove this
             assume().withMessage("pVMs with 16k kernel are not supported yet :(")
                     .that(mOs)
@@ -257,6 +272,14 @@ public abstract class MicrodroidDeviceTestBase {
         return SystemProperties.getInt("ro.board.api_level", 0);
     }
 
+    /**
+     * @return The vendor API level that the device as a whole must conform to, this value should be
+     *     available on both GRF and non-GRF devices.
+     */
+    protected static int getFirstVendorApiLevel() {
+        return SystemProperties.getInt("ro.vendor.api_level", -1);
+    }
+
     protected void assumeSupportedDevice() {
         assume().withMessage("Skip on 5.4 kernel. b/218303240")
                 .that(KERNEL_VERSION)
@@ -272,9 +295,40 @@ public abstract class MicrodroidDeviceTestBase {
     }
 
     protected void assumeNoUpdatableVmSupport() throws VirtualMachineException {
-        assume().withMessage("Secretkeeper not supported")
-                .that(getVirtualMachineManager().isUpdatableVmSupported())
-                .isFalse();
+        assume().withMessage("Secretkeeper not supported").that(isUpdatableVmSupported()).isFalse();
+    }
+
+    protected boolean isUpdatableVmSupported() throws VirtualMachineException {
+        // Pre-36 OS doesn't have VirtualMachineManager#isUpdatableVmSupported.
+        if (Build.VERSION.SDK_INT >= 35) {
+            return getVirtualMachineManager().isUpdatableVmSupported();
+        }
+        return false;
+    }
+
+    protected void ensureVmAttestationSupported() throws Exception {
+        // The first vendor API level is checked because VM attestation requires the VM DICE chain
+        // to be ROM-rooted.
+        int firstVendorApiLevel = getFirstVendorApiLevel();
+        boolean isRemoteAttestationSupported = isRemoteAttestationSupported();
+        if (firstVendorApiLevel >= 202504) {
+            assertWithMessage(
+                            "First vendor API '"
+                                    + firstVendorApiLevel
+                                    + "' (>=202504) must support VM remote attestation")
+                    .that(isRemoteAttestationSupported)
+                    .isTrue();
+        } else {
+            assumeTrue("Skip on VM remote attestation not supported", isRemoteAttestationSupported);
+        }
+    }
+
+    protected boolean isRemoteAttestationSupported() throws VirtualMachineException {
+        // Pre-36 OS doesn't have VirtualMachineManager#isRemoteAttestionSupported
+        if (Build.VERSION.SDK_INT >= 35) {
+            return getVirtualMachineManager().isRemoteAttestationSupported();
+        }
+        return false;
     }
 
     public abstract static class VmEventListener implements VirtualMachineCallback {
@@ -367,6 +421,10 @@ public abstract class MicrodroidDeviceTestBase {
             return mProcessedBootTimeMetrics;
         }
 
+        // Stopping a virtual machine is like pulling the plug on a real computer. VM may be left in
+        // an inconsistent state.
+        // For a graceful shutdown, request the payload to call {@code exit()} and wait for
+        // VirtualMachineCallback#onPayloadFinished} to be called.
         protected void forceStop(VirtualMachine vm) {
             try {
                 vm.stop();
@@ -502,6 +560,11 @@ public abstract class MicrodroidDeviceTestBase {
     public BootResult tryBootVm(String logTag, String vmName)
             throws VirtualMachineException, InterruptedException {
         VirtualMachine vm = getVirtualMachineManager().get(vmName);
+        return tryBootVm(logTag, vm);
+    }
+
+    public BootResult tryBootVm(String logTag, VirtualMachine vm)
+            throws VirtualMachineException, InterruptedException {
         final CompletableFuture<Boolean> payloadStarted = new CompletableFuture<>();
         final CompletableFuture<Integer> deathReason = new CompletableFuture<>();
         final CompletableFuture<Long> endTime = new CompletableFuture<>();
@@ -562,7 +625,7 @@ public abstract class MicrodroidDeviceTestBase {
             stdout.transferTo(out);
             stderr.transferTo(out);
             String output = out.toString("UTF-8");
-            Log.i(tag, "Got output : " + stdout);
+            Log.i(tag, "Got stdout + stderr : " + output);
             return output;
         } catch (IOException e) {
             Log.e(tag, "Error executing: " + command, e);
@@ -578,6 +641,7 @@ public abstract class MicrodroidDeviceTestBase {
         public String mExtraApkTestProp;
         public String mApkContentsPath;
         public String mEncryptedStoragePath;
+        public long mEncryptedStorageSize;
         public String[] mEffectiveCapabilities;
         public int mUid;
         public String mFileContent;
@@ -588,6 +652,8 @@ public abstract class MicrodroidDeviceTestBase {
         public String mConsoleInput;
         public byte[] mInstanceSecret;
         public int mPageSize;
+        public byte[] mPayloadRpData;
+        public boolean mIsNewInstance;
 
         public void assertNoException() {
             if (mException != null) {
@@ -694,7 +760,6 @@ public abstract class MicrodroidDeviceTestBase {
                     public void onPayloadFinished(VirtualMachine vm, int exitCode) {
                         Log.i(logTag, "onPayloadFinished: " + exitCode);
                         payloadFinished.complete(true);
-                        forceStop(vm);
                     }
                 };
 
@@ -703,6 +768,26 @@ public abstract class MicrodroidDeviceTestBase {
         assertThat(payloadReady.getNow(false)).isTrue();
         assertThat(payloadFinished.getNow(false)).isTrue();
         return testResults;
+    }
+
+    protected long getAvailableMemory() {
+        ActivityManager am = getContext().getSystemService(ActivityManager.class);
+        ActivityManager.MemoryInfo memoryInfo = new ActivityManager.MemoryInfo();
+        am.getMemoryInfo(memoryInfo);
+        return memoryInfo.availMem;
+    }
+
+    protected long minMemoryRequired() {
+        assertThat(Build.SUPPORTED_ABIS).isNotEmpty();
+        String primaryAbi = Build.SUPPORTED_ABIS[0];
+        switch (primaryAbi) {
+            case "x86_64":
+                return MIN_MEM_X86_64;
+            case "arm64-v8a":
+            case "arm64-v8a-hwasan":
+                return MIN_MEM_ARM64;
+        }
+        throw new AssertionError("Unsupported ABI: " + primaryAbi);
     }
 
     @FunctionalInterface

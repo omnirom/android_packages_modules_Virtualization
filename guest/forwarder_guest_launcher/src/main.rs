@@ -18,11 +18,11 @@ use anyhow::{anyhow, Context};
 use clap::Parser;
 use csv_async::AsyncReader;
 use debian_service::debian_service_client::DebianServiceClient;
-use debian_service::{QueueOpeningRequest, ReportVmActivePortsRequest};
+use debian_service::{ActivePort, QueueOpeningRequest, ReportVmActivePortsRequest};
 use futures::stream::StreamExt;
 use log::{debug, error};
 use serde::Deserialize;
-use std::collections::HashSet;
+use std::collections::HashMap;
 use std::process::Stdio;
 use tokio::io::BufReader;
 use tokio::process::Command;
@@ -36,30 +36,25 @@ mod debian_service {
 
 const NON_PREVILEGED_PORT_RANGE_START: i32 = 1024;
 const TTYD_PORT: i32 = 7681;
-const TCPSTATES_IP_4: i8 = 4;
 const TCPSTATES_STATE_CLOSE: &str = "CLOSE";
 const TCPSTATES_STATE_LISTEN: &str = "LISTEN";
 
 #[derive(Debug, Deserialize)]
 #[serde(rename_all = "UPPERCASE")]
 struct TcpStateRow {
-    ip: i8,
     lport: i32,
     rport: i32,
+    #[serde(alias = "C-COMM")]
+    c_comm: String,
     newstate: String,
 }
 
 #[derive(Parser)]
 /// Flags for running command
 pub struct Args {
-    /// Host IP address
+    /// path to a file where grpc port number is written
     #[arg(long)]
-    #[arg(alias = "host")]
-    host_addr: String,
-    /// grpc port number
-    #[arg(long)]
-    #[arg(alias = "grpc_port")]
-    grpc_port: String,
+    grpc_port_file: String,
 }
 
 async fn process_forwarding_request_queue(
@@ -92,12 +87,12 @@ async fn process_forwarding_request_queue(
 }
 
 async fn send_active_ports_report(
-    listening_ports: HashSet<i32>,
+    listening_ports: HashMap<i32, ActivePort>,
     client: &mut DebianServiceClient<Channel>,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let res = client
         .report_vm_active_ports(Request::new(ReportVmActivePortsRequest {
-            ports: listening_ports.into_iter().collect(),
+            ports: listening_ports.values().cloned().collect(),
         }))
         .await?
         .into_inner();
@@ -129,22 +124,21 @@ async fn report_active_ports(
 
     // TODO(b/340126051): Consider using NETLINK_SOCK_DIAG for the optimization.
     let listeners = listeners::get_all()?;
-    // TODO(b/340126051): Support distinguished port forwarding for ipv6 as well.
-    let mut listening_ports: HashSet<_> = listeners
+    let mut listening_ports: HashMap<_, _> = listeners
         .iter()
-        .map(|x| x.socket)
-        .filter(|x| x.is_ipv4())
-        .map(|x| x.port().into())
-        .filter(|x| is_forwardable_port(*x))
+        .map(|x| {
+            (
+                x.socket.port().into(),
+                ActivePort { port: x.socket.port().into(), comm: x.process.name.to_string() },
+            )
+        })
+        .filter(|(x, _)| is_forwardable_port(*x))
         .collect();
     send_active_ports_report(listening_ports.clone(), &mut client).await?;
 
     let mut records = csv_reader.records();
     while let Some(record) = records.next().await {
         let row: TcpStateRow = record?.deserialize(Some(&header))?;
-        if row.ip != TCPSTATES_IP_4 {
-            continue;
-        }
         if !is_forwardable_port(row.lport) {
             continue;
         }
@@ -153,7 +147,7 @@ async fn report_active_ports(
         }
         match row.newstate.as_str() {
             TCPSTATES_STATE_LISTEN => {
-                listening_ports.insert(row.lport);
+                listening_ports.insert(row.lport, ActivePort { port: row.lport, comm: row.c_comm });
             }
             TCPSTATES_STATE_CLOSE => {
                 listening_ports.remove(&row.lport);
@@ -168,10 +162,23 @@ async fn report_active_ports(
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
-    env_logger::init();
+    env_logger::builder().filter_level(log::LevelFilter::Debug).init();
     debug!("Starting forwarder_guest_launcher");
     let args = Args::parse();
-    let addr = format!("https://{}:{}", args.host_addr, args.grpc_port);
+    let gateway_ip_addr = netdev::get_default_gateway()?.ipv4[0];
+
+    // Wait for `grpc_port_file` becomes available.
+    const GRPC_PORT_MAX_RETRY_COUNT: u32 = 10;
+    for _ in 0..GRPC_PORT_MAX_RETRY_COUNT {
+        if std::path::Path::new(&args.grpc_port_file).exists() {
+            break;
+        }
+        debug!("{} does not exist. Wait 1 second", args.grpc_port_file);
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+    }
+    let grpc_port = std::fs::read_to_string(&args.grpc_port_file)?.trim().to_string();
+
+    let addr = format!("https://{}:{}", gateway_ip_addr.to_string(), grpc_port);
     let channel = Endpoint::from_shared(addr)?.connect().await?;
     let client = DebianServiceClient::new(channel);
 

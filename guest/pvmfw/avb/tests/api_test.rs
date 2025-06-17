@@ -23,16 +23,22 @@ use pvmfw_avb::{verify_payload, Capability, DebugLevel, PvmfwVerifyError, Verifi
 use std::{
     fs,
     mem::{offset_of, size_of},
-    ptr,
 };
 use utils::*;
 
 const TEST_IMG_WITH_ONE_HASHDESC_PATH: &str = "test_image_with_one_hashdesc.img";
+const TEST_IMG_WITH_NAME_PATH: &str = "test_image_with_name.img";
+const TEST_IMG_WITH_INVALID_PAGE_SIZE_PATH: &str = "test_image_with_invalid_page_size.img";
+const TEST_IMG_WITH_NEGATIVE_PAGE_SIZE_PATH: &str = "test_image_with_negative_page_size.img";
+const TEST_IMG_WITH_OVERFLOW_PAGE_SIZE_PATH: &str = "test_image_with_overflow_page_size.img";
+const TEST_IMG_WITH_0K_PAGE_SIZE_PATH: &str = "test_image_with_0k_page_size.img";
+const TEST_IMG_WITH_1K_PAGE_SIZE_PATH: &str = "test_image_with_1k_page_size.img";
+const TEST_IMG_WITH_4K_PAGE_SIZE_PATH: &str = "test_image_with_4k_page_size.img";
+const TEST_IMG_WITH_9K_PAGE_SIZE_PATH: &str = "test_image_with_9k_page_size.img";
+const TEST_IMG_WITH_16K_PAGE_SIZE_PATH: &str = "test_image_with_16k_page_size.img";
 const TEST_IMG_WITH_ROLLBACK_INDEX_5: &str = "test_image_with_rollback_index_5.img";
-const TEST_IMG_WITH_PROP_DESC_PATH: &str = "test_image_with_prop_desc.img";
 const TEST_IMG_WITH_SERVICE_VM_PROP_PATH: &str = "test_image_with_service_vm_prop.img";
 const TEST_IMG_WITH_UNKNOWN_VM_TYPE_PROP_PATH: &str = "test_image_with_unknown_vm_type_prop.img";
-const TEST_IMG_WITH_MULTIPLE_PROPS_PATH: &str = "test_image_with_multiple_props.img";
 const TEST_IMG_WITH_DUPLICATED_CAP_PATH: &str = "test_image_with_duplicated_capability.img";
 const TEST_IMG_WITH_NON_INITRD_HASHDESC_PATH: &str = "test_image_with_non_initrd_hashdesc.img";
 const TEST_IMG_WITH_INITRD_AND_NON_INITRD_DESC_PATH: &str =
@@ -56,15 +62,16 @@ fn latest_normal_payload_passes_verification() -> Result<()> {
 }
 
 #[test]
-fn latest_trusty_security_vm_kernel_passes_verification() -> Result<()> {
-    let salt = b"trusty_security_vm_salt";
+fn latest_trusty_test_vm_kernel_passes_verification() -> Result<()> {
+    let salt = b"trusty_test_vm_salt";
     let expected_rollback_index = 1;
     assert_payload_without_initrd_passes_verification(
-        &load_latest_trusty_security_vm_signed_kernel()?,
+        &load_latest_trusty_test_vm_signed_kernel()?,
         salt,
         expected_rollback_index,
         vec![Capability::TrustySecurityVm],
         None,
+        Some("trusty_test_vm".to_owned()),
     )
 }
 
@@ -97,6 +104,7 @@ fn payload_expecting_no_initrd_passes_verification_with_no_initrd() -> Result<()
         capabilities: vec![],
         rollback_index: 0,
         page_size: None,
+        name: None,
     };
     assert_eq!(expected_boot_data, verified_boot_data);
 
@@ -142,6 +150,7 @@ fn payload_expecting_no_initrd_passes_verification_with_service_vm_prop() -> Res
         capabilities: vec![Capability::RemoteAttest],
         rollback_index: 0,
         page_size: None,
+        name: None,
     };
     assert_eq!(expected_boot_data, verified_boot_data);
 
@@ -159,32 +168,12 @@ fn payload_with_unknown_vm_type_fails_verification_with_no_initrd() -> Result<()
 }
 
 #[test]
-fn payload_with_multiple_props_fails_verification_with_no_initrd() -> Result<()> {
-    assert_payload_verification_fails(
-        &fs::read(TEST_IMG_WITH_MULTIPLE_PROPS_PATH)?,
-        /* initrd= */ None,
-        &load_trusted_public_key()?,
-        PvmfwVerifyError::InvalidDescriptors(DescriptorError::InvalidContents),
-    )
-}
-
-#[test]
 fn payload_with_duplicated_capability_fails_verification_with_no_initrd() -> Result<()> {
     assert_payload_verification_fails(
         &fs::read(TEST_IMG_WITH_DUPLICATED_CAP_PATH)?,
         /* initrd= */ None,
         &load_trusted_public_key()?,
         SlotVerifyError::InvalidMetadata.into(),
-    )
-}
-
-#[test]
-fn payload_with_prop_descriptor_fails_verification_with_no_initrd() -> Result<()> {
-    assert_payload_verification_fails(
-        &fs::read(TEST_IMG_WITH_PROP_DESC_PATH)?,
-        /* initrd= */ None,
-        &load_trusted_public_key()?,
-        PvmfwVerifyError::UnknownVbmetaProperty,
     )
 }
 
@@ -204,7 +193,7 @@ fn payload_with_empty_public_key_fails_verification() -> Result<()> {
         &load_latest_signed_kernel()?,
         &load_latest_initrd_normal()?,
         /* trusted_public_key= */ &[0u8; 0],
-        SlotVerifyError::PublicKeyRejected.into(),
+        SlotVerifyError::PublicKeyRejected(None).into(),
     )
 }
 
@@ -214,7 +203,7 @@ fn payload_with_an_invalid_public_key_fails_verification() -> Result<()> {
         &load_latest_signed_kernel()?,
         &load_latest_initrd_normal()?,
         /* trusted_public_key= */ &[0u8; 512],
-        SlotVerifyError::PublicKeyRejected.into(),
+        SlotVerifyError::PublicKeyRejected(None).into(),
     )
 }
 
@@ -224,7 +213,7 @@ fn payload_with_a_different_valid_public_key_fails_verification() -> Result<()> 
         &load_latest_signed_kernel()?,
         &load_latest_initrd_normal()?,
         &fs::read(PUBLIC_KEY_RSA2048_PATH)?,
-        SlotVerifyError::PublicKeyRejected.into(),
+        SlotVerifyError::PublicKeyRejected(None).into(),
     )
 }
 
@@ -259,6 +248,72 @@ fn tampered_kernel_fails_verification() -> Result<()> {
         &load_trusted_public_key()?,
         SlotVerifyError::Verification(None).into(),
     )
+}
+
+#[test]
+fn kernel_has_expected_valid_name() {
+    let kernel = fs::read(TEST_IMG_WITH_NAME_PATH).unwrap();
+    assert_eq!(read_name(&kernel), Ok(Some("test_vm_name".to_owned())));
+}
+
+#[test]
+fn kernel_has_expected_missing_name() {
+    let kernel = fs::read(TEST_IMG_WITH_ONE_HASHDESC_PATH).unwrap();
+    assert_eq!(read_name(&kernel), Ok(None));
+}
+
+#[test]
+fn kernel_has_expected_page_size_invalid() {
+    let kernel = fs::read(TEST_IMG_WITH_INVALID_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Err(PvmfwVerifyError::InvalidPageSize));
+}
+
+#[test]
+fn kernel_has_expected_page_size_negative() {
+    let kernel = fs::read(TEST_IMG_WITH_NEGATIVE_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Err(PvmfwVerifyError::InvalidPageSize));
+}
+
+#[test]
+fn kernel_has_expected_page_size_overflow() {
+    let kernel = fs::read(TEST_IMG_WITH_OVERFLOW_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Err(PvmfwVerifyError::InvalidPageSize));
+}
+
+#[test]
+fn kernel_has_expected_page_size_none() {
+    let kernel = fs::read(TEST_IMG_WITH_ONE_HASHDESC_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Ok(None));
+}
+
+#[test]
+fn kernel_has_expected_page_size_0k() {
+    let kernel = fs::read(TEST_IMG_WITH_0K_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Err(PvmfwVerifyError::InvalidPageSize));
+}
+
+#[test]
+fn kernel_has_expected_page_size_1k() {
+    let kernel = fs::read(TEST_IMG_WITH_1K_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Err(PvmfwVerifyError::InvalidPageSize));
+}
+
+#[test]
+fn kernel_has_expected_page_size_4k() {
+    let kernel = fs::read(TEST_IMG_WITH_4K_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Ok(Some(4usize << 10)));
+}
+
+#[test]
+fn kernel_has_expected_page_size_9k() {
+    let kernel = fs::read(TEST_IMG_WITH_9K_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Err(PvmfwVerifyError::InvalidPageSize));
+}
+
+#[test]
+fn kernel_has_expected_page_size_16k() {
+    let kernel = fs::read(TEST_IMG_WITH_16K_PAGE_SIZE_PATH).unwrap();
+    assert_eq!(read_page_size(&kernel), Ok(Some(16usize << 10)));
 }
 
 #[test]
@@ -307,6 +362,32 @@ fn tampered_kernel_footer_fails_verification() -> Result<()> {
 fn extended_initrd_fails_verification() -> Result<()> {
     let mut initrd = load_latest_initrd_normal()?;
     initrd.extend(b"androidboot.vbmeta.digest=1111");
+
+    assert_payload_verification_with_initrd_fails(
+        &load_latest_signed_kernel()?,
+        &initrd,
+        &load_trusted_public_key()?,
+        SlotVerifyError::Verification(None).into(),
+    )
+}
+
+#[test]
+fn tampered_normal_initrd_fails_verification() -> Result<()> {
+    let mut initrd = load_latest_initrd_normal()?;
+    initrd[1] = !initrd[1]; // Flip the bits
+
+    assert_payload_verification_with_initrd_fails(
+        &load_latest_signed_kernel()?,
+        &initrd,
+        &load_trusted_public_key()?,
+        SlotVerifyError::Verification(None).into(),
+    )
+}
+
+#[test]
+fn tampered_debug_initrd_fails_verification() -> Result<()> {
+    let mut initrd = load_latest_initrd_debug()?;
+    initrd[1] = !initrd[1]; // Flip the bits
 
     assert_payload_verification_with_initrd_fails(
         &load_latest_signed_kernel()?,
@@ -374,9 +455,9 @@ fn vbmeta_with_verification_flag_disabled_fails_verification() -> Result<()> {
     // vbmeta_header is unaligned; copy flags to local variable
     let vbmeta_header_flags = vbmeta_header.flags;
     assert_eq!(0, vbmeta_header_flags, "The disable flag should not be set in the latest kernel.");
-    let flags_addr = ptr::addr_of!(vbmeta_header.flags) as *const u8;
+    let flags_addr = (&raw const vbmeta_header.flags).cast::<u8>();
     // SAFETY: It is safe as both raw pointers `flags_addr` and `vbmeta_header` are not null.
-    let flags_offset = unsafe { flags_addr.offset_from(ptr::addr_of!(vbmeta_header) as *const u8) };
+    let flags_offset = unsafe { flags_addr.offset_from((&raw const vbmeta_header).cast::<u8>()) };
     let flags_offset = usize::try_from(footer.vbmeta_offset)? + usize::try_from(flags_offset)?;
 
     // Act.
@@ -418,6 +499,7 @@ fn payload_with_rollback_index() -> Result<()> {
         capabilities: vec![],
         rollback_index: 5,
         page_size: None,
+        name: None,
     };
     assert_eq!(expected_boot_data, verified_boot_data);
     Ok(())

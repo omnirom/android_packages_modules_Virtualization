@@ -13,16 +13,22 @@
 // limitations under the License.
 
 //! This module implements a retry version for multiple DICE functions that
-//! require preallocated output buffer. As the retry functions require
-//! memory allocation on heap, currently we only expose these functions in
-//! std environment.
+//! require preallocated output buffer. When running without std the allocation
+//! of this buffer may fail and callers will see Error::MemoryAllocationError.
+//! When running with std, allocation may fail.
 
-use crate::bcc::{bcc_format_config_descriptor, bcc_main_flow, DiceConfigValues};
+use crate::bcc::{bcc_format_config_descriptor, bcc_main_flow, BccHandover, DiceConfigValues};
 use crate::dice::{
     dice_main_flow, Cdi, CdiValues, DiceArtifacts, InputValues, CDI_SIZE, PRIVATE_KEY_SEED_SIZE,
+    PRIVATE_KEY_SIZE,
 };
 use crate::error::{DiceError, Result};
-use crate::ops::generate_certificate;
+use crate::ops::{generate_certificate, sign_cose_sign1, sign_cose_sign1_with_cdi_leaf_priv};
+#[cfg(feature = "multialg")]
+use crate::{
+    ops::{sign_cose_sign1_multialg, sign_cose_sign1_with_cdi_leaf_priv_multialg},
+    KeyAlgorithm,
+};
 use alloc::vec::Vec;
 #[cfg(feature = "serde_derive")]
 use serde_derive::{Deserialize, Serialize};
@@ -54,6 +60,20 @@ impl DiceArtifacts for OwnedDiceArtifacts {
     }
 }
 
+impl TryFrom<BccHandover<'_>> for OwnedDiceArtifacts {
+    type Error = DiceError;
+
+    fn try_from(artifacts: BccHandover<'_>) -> Result<Self> {
+        let cdi_attest = artifacts.cdi_attest().to_vec().try_into().unwrap();
+        let cdi_seal = artifacts.cdi_seal().to_vec().try_into().unwrap();
+        let bcc = artifacts
+            .bcc()
+            .map(|bcc_slice| bcc_slice.to_vec())
+            .ok_or(DiceError::DiceChainNotFound)?;
+        Ok(OwnedDiceArtifacts { cdi_values: CdiValues { cdi_attest, cdi_seal }, bcc })
+    }
+}
+
 /// Retries the given function with bigger measured buffer size.
 fn retry_with_measured_buffer<F>(mut f: F) -> Result<Vec<u8>>
 where
@@ -62,6 +82,9 @@ where
     let mut buffer = Vec::new();
     match f(&mut buffer) {
         Err(DiceError::BufferTooSmall(actual_size)) => {
+            #[cfg(not(feature = "std"))]
+            buffer.try_reserve_exact(actual_size).map_err(|_| DiceError::MemoryAllocationError)?;
+
             buffer.resize(actual_size, 0);
             f(&mut buffer)?;
         }
@@ -138,6 +161,63 @@ pub fn retry_generate_certificate(
             authority_private_key_seed,
             input_values,
             certificate,
+        )
+    })
+}
+
+/// Signs a message with the given private key and returns the signature
+/// as an encoded CoseSign1 object.
+pub fn retry_sign_cose_sign1(
+    message: &[u8],
+    aad: &[u8],
+    private_key: &[u8; PRIVATE_KEY_SIZE],
+) -> Result<Vec<u8>> {
+    retry_with_measured_buffer(|encoded_signature| {
+        sign_cose_sign1(message, aad, private_key, encoded_signature)
+    })
+}
+
+/// Multialg variant of `retry_sign_cose_sign1`.
+#[cfg(feature = "multialg")]
+pub fn retry_sign_cose_sign1_multialg(
+    message: &[u8],
+    aad: &[u8],
+    private_key: &[u8; PRIVATE_KEY_SIZE],
+    key_algorithm: KeyAlgorithm,
+) -> Result<Vec<u8>> {
+    retry_with_measured_buffer(|encoded_signature| {
+        sign_cose_sign1_multialg(message, aad, private_key, encoded_signature, key_algorithm)
+    })
+}
+
+/// Signs a message with the given the private key derived from the
+/// CDI Attest of the given `dice_artifacts` and returns the signature
+/// as an encoded CoseSign1 object.
+pub fn retry_sign_cose_sign1_with_cdi_leaf_priv(
+    message: &[u8],
+    aad: &[u8],
+    dice_artifacts: &dyn DiceArtifacts,
+) -> Result<Vec<u8>> {
+    retry_with_measured_buffer(|encoded_signature| {
+        sign_cose_sign1_with_cdi_leaf_priv(message, aad, dice_artifacts, encoded_signature)
+    })
+}
+
+/// Multialg variant of `retry_sign_cose_sign1_with_cdi_leaf_priv`.
+#[cfg(feature = "multialg")]
+pub fn retry_sign_cose_sign1_with_cdi_leaf_priv_multialg(
+    message: &[u8],
+    aad: &[u8],
+    dice_artifacts: &dyn DiceArtifacts,
+    key_algorithm: KeyAlgorithm,
+) -> Result<Vec<u8>> {
+    retry_with_measured_buffer(|encoded_signature| {
+        sign_cose_sign1_with_cdi_leaf_priv_multialg(
+            message,
+            aad,
+            dice_artifacts,
+            encoded_signature,
+            key_algorithm,
         )
     })
 }

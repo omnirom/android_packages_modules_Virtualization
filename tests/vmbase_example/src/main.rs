@@ -16,7 +16,8 @@
 
 use android_system_virtualizationservice::{
     aidl::android::system::virtualizationservice::{
-        CpuTopology::CpuTopology, DiskImage::DiskImage, VirtualMachineConfig::VirtualMachineConfig,
+        CpuOptions::CpuOptions, CpuOptions::CpuTopology::CpuTopology, DiskImage::DiskImage,
+        VirtualMachineConfig::VirtualMachineConfig,
         VirtualMachineRawConfig::VirtualMachineRawConfig,
     },
     binder::{ParcelFileDescriptor, ProcessState},
@@ -27,7 +28,7 @@ use std::{
     collections::{HashSet, VecDeque},
     fs::File,
     io::{self, BufRead, BufReader, Read, Write},
-    panic, thread,
+    thread,
 };
 use vmclient::{DeathReason, VmInstance};
 
@@ -57,11 +58,6 @@ fn run_test(
             .with_tag("vmbase")
             .with_max_level(log::LevelFilter::Debug),
     );
-
-    // Redirect panic messages to logcat.
-    panic::set_hook(Box::new(|panic_info| {
-        log::error!("{}", panic_info);
-    }));
 
     // We need to start the thread pool for Binder to work properly, especially link_to_death.
     ProcessState::start_thread_pool();
@@ -106,7 +102,7 @@ fn run_test(
         disks: vec![disk_image, empty_disk_image],
         protectedVm: false,
         memoryMib: 300,
-        cpuTopology: CpuTopology::ONE_CPU,
+        cpuOptions: CpuOptions { cpuTopology: CpuTopology::CpuCount(1) },
         platformVersion: "~1.0".to_string(),
         gdbPort: 0, // no gdb
         ..Default::default()
@@ -120,10 +116,9 @@ fn run_test(
         /* consoleIn */ None,
         Some(log_writer),
         /* dump_dt */ None,
-        None,
     )
     .context("Failed to create VM")?;
-    vm.start().context("Failed to start VM")?;
+    vm.start(None).context("Failed to start VM")?;
     info!("Started example VM.");
 
     // Wait for VM to finish, and check that it shut down cleanly.

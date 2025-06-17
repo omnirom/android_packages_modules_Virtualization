@@ -17,6 +17,7 @@
 use crate::create_partition::command_create_partition;
 use crate::{get_service, RunAppConfig, RunCustomVmConfig, RunMicrodroidConfig};
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
+    CpuOptions::CpuOptions,
     IVirtualizationService::IVirtualizationService,
     PartitionType::PartitionType,
     VirtualMachineAppConfig::{
@@ -34,6 +35,7 @@ use microdroid_payload_config::VmPayloadConfig;
 use rand::{distributions::Alphanumeric, Rng};
 use std::fs;
 use std::fs::File;
+use std::fs::OpenOptions;
 use std::io;
 use std::io::{Read, Write};
 use std::os::fd::AsFd;
@@ -85,8 +87,8 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
         )?;
     }
 
-    let instance_id = if cfg!(llpvm_changes) {
-        let id_file = config.instance_id()?;
+    let instance_id = {
+        let id_file = config.instance_id;
         if id_file.exists() {
             let mut id = [0u8; 64];
             let mut instance_id_file = File::open(id_file)?;
@@ -98,9 +100,6 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
             instance_id_file.write_all(&id)?;
             id
         }
-    } else {
-        // if llpvm feature flag is disabled, instance_id is not used.
-        [0u8; 64]
     };
 
     let storage = if let Some(ref path) = config.microdroid.storage {
@@ -111,6 +110,8 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
                 config.microdroid.storage_size.unwrap_or(10 * 1024 * 1024),
                 PartitionType::ENCRYPTEDSTORE,
             )?;
+        } else if let Some(storage_size) = config.microdroid.storage_size {
+            set_encrypted_storage(service.as_ref(), path, storage_size)?;
         }
         Some(open_parcel_file(path, true)?)
     } else {
@@ -160,6 +161,7 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
         ..Default::default()
     };
 
+    let cpu_options = CpuOptions { cpuTopology: config.common.cpu_topology };
     if config.debug.enable_earlycon() {
         if config.debug.debug != DebugLevel::FULL {
             bail!("earlycon is only supported for debuggable VMs")
@@ -188,7 +190,7 @@ pub fn command_run_app(config: RunAppConfig) -> Result<(), Error> {
         debugLevel: config.debug.debug,
         protectedVm: config.common.protected,
         memoryMib: config.common.mem.unwrap_or(0) as i32, // 0 means use the VM default
-        cpuTopology: config.common.cpu_topology,
+        cpuOptions: cpu_options,
         customConfig: Some(custom_config),
         osName: os_name.to_string(),
         hugePages: config.common.hugepages,
@@ -249,10 +251,8 @@ pub fn command_run_microdroid(config: RunMicrodroidConfig) -> Result<(), Error> 
         ..Default::default()
     };
 
-    if cfg!(llpvm_changes) {
-        app_config.set_instance_id(work_dir.join("instance_id"))?;
-        println!("instance_id file path: {}", app_config.instance_id()?.display());
-    }
+    app_config.set_instance_id(work_dir.join("instance_id"));
+    println!("instance_id file path: {}", app_config.instance_id.display());
 
     command_run_app(app_config)
 }
@@ -273,7 +273,7 @@ pub fn command_run(config: RunCustomVmConfig) -> Result<(), Error> {
     if let Some(gdb) = config.debug.gdb {
         vm_config.gdbPort = gdb.get() as i32;
     }
-    vm_config.cpuTopology = config.common.cpu_topology;
+    vm_config.cpuOptions = CpuOptions { cpuTopology: config.common.cpu_topology.clone() };
     vm_config.hugePages = config.common.hugepages;
     vm_config.boostUclamp = config.common.boost_uclamp;
     vm_config.teeServices = config.common.tee_services().to_vec();
@@ -339,11 +339,10 @@ fn run(
     } else {
         None
     };
+    let vm = VmInstance::create(service, config, console_out, console_in, log, dump_dt)
+        .context("Failed to create VM")?;
     let callback = Box::new(Callback {});
-    let vm =
-        VmInstance::create(service, config, console_out, console_in, log, dump_dt, Some(callback))
-            .context("Failed to create VM")?;
-    vm.start().context("Failed to start VM")?;
+    vm.start(Some(callback)).context("Failed to start VM")?;
 
     let debug_level = get_debug_level(config).unwrap_or(DebugLevel::NONE);
 
@@ -367,6 +366,22 @@ fn parse_extra_apk_list(apk: &Path, config_path: &str) -> Result<Vec<PathBuf>, E
     let config_file = archive.by_name(config_path)?;
     let config: VmPayloadConfig = serde_json::from_reader(config_file)?;
     Ok(config.extra_apks.into_iter().map(|x| x.path.into()).collect())
+}
+
+fn set_encrypted_storage(
+    service: &dyn IVirtualizationService,
+    image_path: &Path,
+    size: u64,
+) -> Result<(), Error> {
+    let image = OpenOptions::new()
+        .create_new(false)
+        .read(true)
+        .write(true)
+        .open(image_path)
+        .with_context(|| format!("Failed to open {:?}", image_path))?;
+
+    service.setEncryptedStorageSize(&ParcelFileDescriptor::new(image), size.try_into()?)?;
+    Ok(())
 }
 
 struct Callback {}

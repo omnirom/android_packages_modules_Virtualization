@@ -15,15 +15,12 @@ android_app_certificate {
 
 java_defaults {
     name: "MicrodroidTestAppsDefaults",
-    test_suites: [
-        "cts",
-        "vts",
-        "general-tests",
-    ],
     static_libs: [
+        "avf_aconfig_flags_java",
         "com.android.microdroid.testservice-java",
         "com.android.microdroid.test.vmshare_service-java",
         "com.android.virt.vm_attestation.testservice-java",
+        "platform-test-annotations",
     ],
     certificate: ":MicrodroidTestAppCert",
     sdk_version: "test_current",
@@ -31,6 +28,9 @@ java_defaults {
     use_embedded_native_libs: true,
     // We only support 64-bit ABI, but CTS demands all APKs to be multi-ABI.
     compile_multilib: "both",
+    lint: {
+        error_checks: ["NewApi"],
+    },
 }
 
 java_defaults {
@@ -61,6 +61,74 @@ java_defaults {
         // Non-VM payload libraries
         "libhwtrust_jni",
     ],
+    // AVF java APIs were introduced in Android U.
+    min_sdk_version: "34",
+}
+
+DATA = [
+    ":MicrodroidTestAppUpdated",
+    ":MicrodroidTestHelperAppRelaxedRollbackProtection_V5",
+    ":MicrodroidTestHelperAppRelaxedRollbackProtection_V6",
+    ":MicrodroidTestHelperAppRelaxedRollbackProtection_V7_inc_rollback_version",
+    ":MicrodroidTestHelperAppRelaxedRollbackProtection_no_permission",
+    ":MicrodroidTestHelperAppRelaxedRollbackProtection_no_rollback_index",
+    ":MicrodroidVmShareApp",
+    ":test_microdroid_vendor_image",
+    ":test_microdroid_vendor_image_unsigned",
+]
+
+android_test_helper_app {
+    name: "MicrodroidTestHelperAppRelaxedRollbackProtection_V5",
+    defaults: ["MicrodroidTestAppsDefaults"],
+    manifest: "AndroidManifestV5_relaxed_rollback_protection.xml",
+    jni_libs: [
+        "MicrodroidTestNativeLib",
+        "MicrodroidTestNativeLibWithLibIcu",
+    ],
+    min_sdk_version: "33",
+}
+
+android_test_helper_app {
+    name: "MicrodroidTestHelperAppRelaxedRollbackProtection_V6",
+    defaults: ["MicrodroidTestAppsDefaults"],
+    manifest: "AndroidManifestV6_relaxed_rollback_protection.xml",
+    jni_libs: [
+        "MicrodroidTestNativeLib",
+        "MicrodroidTestNativeLibWithLibIcu",
+    ],
+    min_sdk_version: "33",
+}
+
+android_test_helper_app {
+    name: "MicrodroidTestHelperAppRelaxedRollbackProtection_V7_inc_rollback_version",
+    defaults: ["MicrodroidTestAppsDefaults"],
+    manifest: "AndroidManifestV7_relaxed_rollback_protection_inc_rollback_version.xml",
+    jni_libs: [
+        "MicrodroidTestNativeLib",
+        "MicrodroidTestNativeLibWithLibIcu",
+    ],
+    min_sdk_version: "33",
+}
+
+android_test_helper_app {
+    name: "MicrodroidTestHelperAppRelaxedRollbackProtection_no_rollback_index",
+    defaults: ["MicrodroidTestAppsDefaults"],
+    manifest: "AndroidManifestV5_relaxed_rollback_protection_no_rollback_index.xml",
+    jni_libs: [
+        "MicrodroidTestNativeLib",
+        "MicrodroidTestNativeLibWithLibIcu",
+    ],
+    min_sdk_version: "33",
+}
+
+android_test_helper_app {
+    name: "MicrodroidTestHelperAppRelaxedRollbackProtection_no_permission",
+    defaults: ["MicrodroidTestAppsDefaults"],
+    manifest: "AndroidManifestV5_relaxed_rollback_protection_no_permission.xml",
+    jni_libs: [
+        "MicrodroidTestNativeLib",
+        "MicrodroidTestNativeLibWithLibIcu",
+    ],
     min_sdk_version: "33",
 }
 
@@ -68,13 +136,76 @@ android_test {
     name: "MicrodroidTestApp",
     defaults: ["MicrodroidVersionsTestAppDefaults"],
     manifest: "AndroidManifestV5.xml",
-    // Defined in ../vmshareapp/Android.bp
-    data: [
-        ":MicrodroidTestAppUpdated",
-        ":MicrodroidVmShareApp",
-        ":test_microdroid_vendor_image",
-        ":test_microdroid_vendor_image_unsigned",
-    ],
+    test_suites: ["general-tests"],
+    test_config_template: "AndroidTestTemplate.xml",
+    auto_gen_config: true,
+    data: DATA,
+}
+
+android_test {
+    name: "MicrodroidTestApp.CTS",
+    defaults: ["MicrodroidVersionsTestAppDefaults"],
+    manifest: "AndroidManifestV5.xml",
+    test_config_template: "AndroidTestTemplate.xml",
+    test_suites: ["cts"],
+    auto_gen_config: true,
+    test_options: {
+        tradefed_options: [
+            {
+                name: "include-annotation",
+                value: "com.android.compatibility.common.util.CddTest",
+            },
+            {
+                name: "test-suite-tag",
+                value: "cts",
+            },
+        ],
+    },
+    data: DATA,
+}
+
+android_test {
+    name: "MicrodroidTestApp.VTS",
+    defaults: ["MicrodroidVersionsTestAppDefaults"],
+    manifest: "AndroidManifestV5.xml",
+    test_config_template: "AndroidTestTemplate.xml",
+    test_suites: ["vts"],
+    auto_gen_config: true,
+    test_options: {
+        tradefed_options: [
+            {
+                name: "include-annotation",
+                value: "com.android.compatibility.common.util.VsrTest",
+            },
+            {
+                name: "test-suite-tag",
+                value: "vts",
+            },
+        ],
+    },
+    data: DATA,
+}
+
+android_test {
+    name: "MicrodroidTestApp.GTS",
+    defaults: ["MicrodroidVersionsTestAppDefaults"],
+    manifest: "AndroidManifestV5.xml",
+    test_config_template: "AndroidTestTemplate.xml",
+    test_suites: ["gts"],
+    auto_gen_config: true,
+    test_options: {
+        tradefed_options: [
+            {
+                name: "include-annotation",
+                value: "com.android.compatibility.common.util.GmsTest",
+            },
+            {
+                name: "test-suite-tag",
+                value: "gts",
+            },
+        ],
+    },
+    data: DATA,
 }
 
 android_test_helper_app {
@@ -106,6 +237,8 @@ cc_defaults {
         "liblog",
         "libprotobuf-cpp-lite-ndk",
     ],
+    // We've added support for updatable payloads in Android U.
+    min_sdk_version: "UpsideDownCake",
 }
 
 cc_library_shared {
@@ -116,6 +249,17 @@ cc_library_shared {
 cc_library_shared {
     name: "MicrodroidTestNativeLib",
     defaults: ["MicrodroidTestNativeLibDefaults"],
+}
+
+cc_library_shared {
+    name: "MicrodroidTestNativeLibWithLibIcu",
+    defaults: ["MicrodroidTestNativeLibDefaults"],
+    shared_libs: [
+        "libicu",
+    ],
+    cflags: [
+        "-D__MICRODROID_TEST_PAYLOAD_USES_LIBICU__",
+    ],
 }
 
 cc_library_shared {
@@ -184,7 +328,6 @@ rust_ffi_shared {
         "libandroid_logger",
         "libanyhow",
         "libavflog",
-        "libcstr",
         "liblog_rust",
         "libvm_payload_rs",
     ],

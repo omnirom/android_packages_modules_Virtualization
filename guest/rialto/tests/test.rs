@@ -40,7 +40,6 @@ use service_vm_fake_chain::client_vm::{
 use service_vm_manager::{ServiceVm, VM_MEMORY_MB};
 use std::fs;
 use std::fs::File;
-use std::panic;
 use std::path::PathBuf;
 use std::str::FromStr;
 use vmclient::VmInstance;
@@ -55,13 +54,9 @@ const UNSIGNED_RIALTO_PATH: &str = "/data/local/tmp/rialto_test/arm64/rialto_uns
 const INSTANCE_IMG_PATH: &str = "/data/local/tmp/rialto_test/arm64/instance.img";
 const TEST_CERT_CHAIN_PATH: &str = "testdata/rkp_cert_chain.der";
 
-#[cfg(dice_changes)]
 #[test]
 fn process_requests_in_protected_vm() -> Result<()> {
     if hypervisor_props::is_protected_vm_supported()? {
-        // The test is skipped if the feature flag |dice_changes| is not enabled, because when
-        // the flag is off, the DICE chain is truncated in the pvmfw, and the service VM cannot
-        // verify the chain due to the missing entries in the chain.
         check_processing_requests(VmType::ProtectedVm, None)
     } else {
         warn!("pVMs are not supported on device, skipping test");
@@ -300,10 +295,6 @@ fn start_service_vm(vm_type: VmType, vm_memory_mb: Option<i32>) -> Result<Servic
             .with_tag("rialto")
             .with_max_level(log::LevelFilter::Debug),
     );
-    // Redirect panic messages to logcat.
-    panic::set_hook(Box::new(|panic_info| {
-        log::error!("{}", panic_info);
-    }));
     // We need to start the thread pool for Binder to work properly, especially link_to_death.
     ProcessState::start_thread_pool();
     ServiceVm::start_vm(vm_instance(vm_type, vm_memory_mb)?, vm_type)
@@ -347,7 +338,6 @@ fn nonprotected_vm_instance(memory_mib: i32) -> Result<VmInstance> {
         /* consoleIn */ None,
         log,
         /* dump_dt */ None,
-        None,
     )
     .context("Failed to create VM")
 }

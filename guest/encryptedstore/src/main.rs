@@ -30,7 +30,9 @@ use std::os::unix::fs::{FileTypeExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const E2FSCK_BIN: &str = "/system/bin/e2fsck";
 const MK2FS_BIN: &str = "/system/bin/mke2fs";
+const RESIZE2FS_BIN: &str = "/system/bin/resize2fs";
 const UNFORMATTED_STORAGE_MAGIC: &str = "UNFORMATTED-STORAGE";
 
 fn main() {
@@ -91,6 +93,8 @@ fn encryptedstore_init(blkdevice: &Path, key: &str, mountpoint: &Path) -> Result
     if needs_formatting {
         info!("Freshly formatting the crypt device");
         format_ext4(&crypt_device)?;
+    } else {
+        resize_fs(&crypt_device)?;
     }
     mount(&crypt_device, mountpoint)
         .with_context(|| format!("Unable to mount {:?}", crypt_device))?;
@@ -120,6 +124,7 @@ fn enable_crypt(data_device: &Path, key: &str, name: &str) -> Result<PathBuf> {
         .key(&key)
         .opt_param("sector_size:4096")
         .opt_param("iv_large_sectors")
+        .opt_param("allow_discards") // This allows re-compaction of underlying disk img in host
         .build()
         .context("Couldn't build the DMCrypt target")?;
     let dm = dm::DeviceMapper::new()?;
@@ -173,10 +178,31 @@ fn format_ext4(device: &Path) -> Result<()> {
     Ok(())
 }
 
+fn resize_fs(device: &Path) -> Result<()> {
+    // Check the partition
+    Command::new(E2FSCK_BIN)
+        .arg("-fvy")
+        .arg(device)
+        .status()
+        .context("failed to execute e2fsck")?;
+
+    // Resize the filesystem to the size of the device.
+    Command::new(RESIZE2FS_BIN).arg(device).status().context("failed to execute resize2fs")?;
+
+    // Finally check again if we were successful.
+    Command::new(E2FSCK_BIN)
+        .arg("-fvy")
+        .arg(device)
+        .status()
+        .context("failed to execute e2fsck")?;
+
+    Ok(())
+}
+
 fn mount(source: &Path, mountpoint: &Path) -> Result<()> {
     create_dir_all(mountpoint).with_context(|| format!("Failed to create {:?}", &mountpoint))?;
     let mount_options = CString::new(
-        "fscontext=u:object_r:encryptedstore_fs:s0,context=u:object_r:encryptedstore_file:s0",
+        "fscontext=u:object_r:encryptedstore_fs:s0,context=u:object_r:encryptedstore_file:s0,discard",
     )
     .unwrap();
     let source = CString::new(source.as_os_str().as_bytes())?;

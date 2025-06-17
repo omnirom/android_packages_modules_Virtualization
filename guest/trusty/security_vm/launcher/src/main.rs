@@ -15,8 +15,9 @@
 //! A client for trusty security VMs during early boot.
 
 use android_system_virtualizationservice::aidl::android::system::virtualizationservice::{
-    CpuTopology::CpuTopology, IVirtualizationService::IVirtualizationService,
-    VirtualMachineConfig::VirtualMachineConfig, VirtualMachineRawConfig::VirtualMachineRawConfig,
+    CpuOptions::CpuOptions, CpuOptions::CpuTopology::CpuTopology,
+    IVirtualizationService::IVirtualizationService, VirtualMachineConfig::VirtualMachineConfig,
+    VirtualMachineRawConfig::VirtualMachineRawConfig,
 };
 use android_system_virtualizationservice::binder::{ParcelFileDescriptor, Strong};
 use anyhow::{Context, Result};
@@ -31,6 +32,10 @@ pub struct Args {
     /// Path to the trusty kernel image.
     #[arg(long)]
     kernel: PathBuf,
+
+    // Whether the kernel should be loaded as a bootloader
+    #[arg(long)]
+    load_kernel_as_bootloader: bool,
 
     /// Whether the VM is protected or not.
     #[arg(long)]
@@ -57,8 +62,8 @@ fn get_service() -> Result<Strong<dyn IVirtualizationService>> {
 
 fn parse_cpu_topology(s: &str) -> Result<CpuTopology, String> {
     match s {
-        "one-cpu" => Ok(CpuTopology::ONE_CPU),
-        "match-host" => Ok(CpuTopology::MATCH_HOST),
+        "one-cpu" => Ok(CpuTopology::CpuCount(1)),
+        "match-host" => Ok(CpuTopology::MatchHost(true)),
         _ => Err(format!("Invalid cpu topology {}", s)),
     }
 }
@@ -70,13 +75,19 @@ fn main() -> Result<()> {
 
     let kernel =
         File::open(&args.kernel).with_context(|| format!("Failed to open {:?}", &args.kernel))?;
+    let kernel = ParcelFileDescriptor::new(kernel);
+
+    // If --load-kernel-as-bootloader option is present, then load kernel as bootloader
+    let (kernel, bootloader) =
+        if args.load_kernel_as_bootloader { (None, Some(kernel)) } else { (Some(kernel), None) };
 
     let vm_config = VirtualMachineConfig::RawConfig(VirtualMachineRawConfig {
         name: args.name.to_owned(),
-        kernel: Some(ParcelFileDescriptor::new(kernel)),
+        kernel,
+        bootloader,
         protectedVm: args.protected,
         memoryMib: args.memory_size_mib,
-        cpuTopology: args.cpu_topology,
+        cpuOptions: CpuOptions { cpuTopology: args.cpu_topology },
         platformVersion: "~1.0".to_owned(),
         // TODO: add instanceId
         ..Default::default()
@@ -91,14 +102,13 @@ fn main() -> Result<()> {
         None, // console_out
         None, // log
         None, // dump_dt
-        None, // callback
     )
     .context("Failed to create VM")?;
-    vm.start().context("Failed to start VM")?;
+    vm.start(None /* callback */).context("Failed to start VM")?;
 
-    println!("started trusty_security_vm_launcher VM");
+    println!("started {} VM", args.name.to_owned());
     let death_reason = vm.wait_for_death();
-    eprintln!("trusty_security_vm_launcher ended: {:?}", death_reason);
+    eprintln!("{} ended: {:?}", args.name.to_owned(), death_reason);
 
     // TODO(b/331320802): we may want to use android logger instead of stdio_to_kmsg?
 

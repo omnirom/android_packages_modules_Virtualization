@@ -244,13 +244,14 @@ fn try_main() -> Result<()> {
 fn verify_payload_with_instance_img(
     metadata: &Metadata,
     dice: &DiceDriver,
+    state: &mut VmInstanceState,
 ) -> Result<MicrodroidData> {
     let mut instance = InstanceDisk::new().context("Failed to load instance.img")?;
     let saved_data = instance.read_microdroid_data(dice).context("Failed to read identity data")?;
 
     if is_strict_boot() {
         // Provisioning must happen on the first boot and never again.
-        if is_new_instance() {
+        if Path::new(AVF_NEW_INSTANCE).exists() {
             ensure!(
                 saved_data.is_none(),
                 MicrodroidError::PayloadInvalidConfig(
@@ -286,15 +287,28 @@ fn verify_payload_with_instance_img(
             );
             info!("Saved data is verified.");
         }
+        *state = VmInstanceState::PreviouslySeen;
         saved_data
     } else {
         info!("Saving verified data.");
         instance
             .write_microdroid_data(&extracted_data, dice)
             .context("Failed to write identity data")?;
+        *state = VmInstanceState::NewlyCreated;
         extracted_data
     };
     Ok(instance_data)
+}
+
+// The VM instance run can be
+// 1. Either Newly created - which can happen if this is really a new VM instance (or a malicious
+//    Android has deleted relevant secrets)
+// 2. Or Re-run from an already seen VM instance.
+#[derive(PartialEq, Eq)]
+enum VmInstanceState {
+    Unknown,
+    NewlyCreated,
+    PreviouslySeen,
 }
 
 fn try_run_payload(
@@ -310,13 +324,14 @@ fn try_run_payload(
             .context("Failed to load DICE from driver")?
     };
 
+    let mut state = VmInstanceState::Unknown;
     // Microdroid skips checking payload against instance image iff the device supports
-    // secretkeeper. In that case Microdroid use VmSecret::V2, which provide protection against
-    // rollback of boot images and packages.
+    // secretkeeper. In that case Microdroid use VmSecret::V2, which provides instance state
+    // and protection against rollback of boot images and packages.
     let instance_data = if should_defer_rollback_protection() {
         verify_payload(&metadata, None)?
     } else {
-        verify_payload_with_instance_img(&metadata, &dice)?
+        verify_payload_with_instance_img(&metadata, &dice, &mut state)?
     };
 
     let payload_metadata = metadata.payload.ok_or_else(|| {
@@ -326,8 +341,16 @@ fn try_run_payload(
     // To minimize the exposure to untrusted data, derive dice profile as soon as possible.
     info!("DICE derivation for payload");
     let dice_artifacts = dice_derivation(dice, &instance_data, &payload_metadata)?;
-    let vm_secret =
-        VmSecret::new(dice_artifacts, service).context("Failed to create VM secrets")?;
+    let vm_secret = VmSecret::new(dice_artifacts, service, &mut state)
+        .context("Failed to create VM secrets")?;
+
+    let is_new_instance = match state {
+        VmInstanceState::NewlyCreated => true,
+        VmInstanceState::PreviouslySeen => false,
+        VmInstanceState::Unknown => {
+            bail!("Vm instance state is still unknown, this should not have happened");
+        }
+    };
 
     if cfg!(dice_changes) {
         // Now that the DICE derivation is done, it's ok to allow payload code to run.
@@ -339,14 +362,6 @@ fn try_run_payload(
         // can't get hold of dice chain stored there.
         umount2("/microdroid_resources", MntFlags::MNT_DETACH)?;
     }
-
-    // Run encryptedstore binary to prepare the storage
-    let encryptedstore_child = if Path::new(ENCRYPTEDSTORE_BACKING_DEVICE).exists() {
-        info!("Preparing encryptedstore ...");
-        Some(prepare_encryptedstore(&vm_secret).context("encryptedstore run")?)
-    } else {
-        None
-    };
 
     let mut zipfuse = Zipfuse::default();
 
@@ -382,11 +397,25 @@ fn try_run_payload(
     );
     mount_extra_apks(&config, &mut zipfuse)?;
 
+    // Wait until apex config is done. (e.g. linker configuration for apexes)
+    wait_for_property_true(APEX_CONFIG_DONE_PROP).context("Failed waiting for apex config done")?;
+
+    // Run encryptedstore binary to prepare the storage
+    // Postpone initialization until apex mount completes to ensure e2fsck and resize2fs binaries
+    // are accessible.
+    let encryptedstore_child = if Path::new(ENCRYPTEDSTORE_BACKING_DEVICE).exists() {
+        info!("Preparing encryptedstore ...");
+        Some(prepare_encryptedstore(&vm_secret).context("encryptedstore run")?)
+    } else {
+        None
+    };
+
     register_vm_payload_service(
         allow_restricted_apis,
         service.clone(),
         vm_secret,
         vm_payload_service_fd,
+        is_new_instance,
     )?;
 
     // Set export_tombstones if enabled
@@ -395,9 +424,6 @@ fn try_run_payload(
         system_properties::write("microdroid_manager.export_tombstones.enabled", "1")
             .context("set microdroid_manager.export_tombstones.enabled")?;
     }
-
-    // Wait until apex config is done. (e.g. linker configuration for apexes)
-    wait_for_property_true(APEX_CONFIG_DONE_PROP).context("Failed waiting for apex config done")?;
 
     // Trigger init post-fs-data. This will start authfs if we wask it to.
     if config.enable_authfs {
@@ -486,10 +512,6 @@ fn get_vms_rpc_binder() -> Result<Strong<dyn IVirtualMachineService>> {
 
 fn is_strict_boot() -> bool {
     Path::new(AVF_STRICT_BOOT).exists()
-}
-
-fn is_new_instance() -> bool {
-    Path::new(AVF_NEW_INSTANCE).exists()
 }
 
 fn is_verified_boot() -> bool {
@@ -670,14 +692,39 @@ fn exec_task(task: &Task, service: &Strong<dyn IVirtualMachineService>) -> Resul
         });
     }
 
-    if !is_debuggable()? {
-        command.stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
-    }
+    // Never accept input from outside
+    command.stdin(Stdio::null());
+
+    // If the VM is debuggable, let stdout/stderr go outside via /dev/kmsg to ease the debugging
+    let (stdout, stderr) = if is_debuggable()? {
+        use std::os::fd::FromRawFd;
+        let kmsg_fd = env::var("ANDROID_FILE__dev_kmsg").unwrap().parse::<i32>().unwrap();
+        // SAFETY: no one closes kmsg_fd
+        unsafe { (Stdio::from_raw_fd(kmsg_fd), Stdio::from_raw_fd(kmsg_fd)) }
+    } else {
+        (Stdio::null(), Stdio::null())
+    };
+    command.stdout(stdout);
+    command.stderr(stderr);
 
     info!("notifying payload started");
     service.notifyPayloadStarted()?;
 
-    let exit_status = command.spawn()?.wait()?;
+    let mut payload_process = command.spawn().context("failed to spawn payload process")?;
+    info!("payload pid = {:?}", payload_process.id());
+
+    // SAFETY: setpriority doesn't take any pointers
+    unsafe {
+        let ret = libc::setpriority(libc::PRIO_PROCESS, payload_process.id(), -20);
+        if ret != 0 {
+            error!(
+                "failed to adjust priority of the payload: {:#?}",
+                std::io::Error::last_os_error()
+            );
+        }
+    }
+
+    let exit_status = payload_process.wait()?;
     match exit_status.code() {
         Some(exit_code) => Ok(exit_code),
         None => Err(match exit_status.signal() {

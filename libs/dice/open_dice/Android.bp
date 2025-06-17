@@ -61,6 +61,35 @@ rust_library {
         "//apex_available:platform",
         "com.android.virt",
     ],
+    min_sdk_version: "35",
+}
+
+rust_library {
+    name: "libdiced_open_dice_multialg",
+    defaults: ["libdiced_open_dice_defaults"],
+    host_supported: true,
+    vendor_available: true,
+    rustlibs: [
+        "libcoset",
+        "libopen_dice_android_bindgen_multialg",
+        "libopen_dice_cbor_bindgen_multialg",
+        "libzeroize",
+    ],
+    features: [
+        "std",
+        "multialg",
+    ],
+    shared_libs: [
+        "libcrypto",
+    ],
+    visibility: [
+        "//system/software_defined_vehicle:__subpackages__",
+    ],
+    apex_available: [
+        "//apex_available:platform",
+        "com.android.virt",
+    ],
+    min_sdk_version: "35",
 }
 
 rust_defaults {
@@ -75,6 +104,19 @@ rust_test {
     defaults: ["libdiced_open_dice_test_defaults"],
     rustlibs: [
         "libdiced_open_dice",
+        "libcoset",
+    ],
+}
+
+rust_test {
+    name: "libdiced_open_dice_multialg.integration_test",
+    defaults: ["libdiced_open_dice_test_defaults"],
+    rustlibs: [
+        "libdiced_open_dice_multialg",
+        "libcoset",
+    ],
+    features: [
+        "multialg",
     ],
 }
 
@@ -83,6 +125,7 @@ rust_test {
     defaults: ["libdiced_open_dice_test_defaults"],
     rustlibs: [
         "libdiced_open_dice_nostd",
+        "libcoset_nostd",
     ],
 }
 
@@ -128,7 +171,7 @@ rust_defaults {
 
 rust_defaults {
     name: "libopen_dice_cbor_bindgen.rust_defaults",
-    wrapper_src: "bindgen/dice.h",
+    wrapper_src: "bindgen/dice/dice.h",
     crate_name: "open_dice_cbor_bindgen",
     source_stem: "bindings",
     bindgen_flags: [
@@ -146,6 +189,7 @@ rust_defaults {
         "--allowlist-function=DiceKdf",
         "--allowlist-function=DiceKeypairFromSeed",
         "--allowlist-function=DiceSign",
+        "--allowlist-function=DiceCoseSignAndEncodeSign1",
         "--allowlist-function=DiceVerify",
         "--allowlist-function=DiceGenerateCertificate",
 
@@ -167,6 +211,23 @@ rust_bindgen {
         "libopen_dice_cbor_bindgen.rust_defaults",
     ],
     whole_static_libs: ["libopen_dice_cbor"],
+    shared_libs: ["libcrypto"],
+    min_sdk_version: "35",
+}
+
+rust_bindgen {
+    name: "libopen_dice_cbor_bindgen_multialg",
+    defaults: [
+        "libopen_dice.rust_defaults",
+        "libopen_dice_cbor_bindgen.rust_defaults",
+    ],
+    bindgen_flags: [
+        "--rustified-enum DiceKeyAlgorithm",
+        "--allowlist-type=DiceContext",
+    ],
+    whole_static_libs: ["libopen_dice_cbor_multialg"],
+    shared_libs: ["libcrypto"],
+    min_sdk_version: "35",
 }
 
 rust_bindgen {
@@ -184,7 +245,7 @@ rust_bindgen {
 
 rust_defaults {
     name: "libopen_dice_android_bindgen.rust_defaults",
-    wrapper_src: "bindgen/android.h",
+    wrapper_src: "bindgen/android/android.h",
     crate_name: "open_dice_android_bindgen",
     source_stem: "bindings",
     bindgen_flags: [
@@ -224,6 +285,20 @@ rust_bindgen {
         "libopen_dice_cbor_bindgen",
     ],
     whole_static_libs: ["libopen_dice_android"],
+    min_sdk_version: "35",
+}
+
+rust_bindgen {
+    name: "libopen_dice_android_bindgen_multialg",
+    defaults: [
+        "libopen_dice.rust_defaults",
+        "libopen_dice_android_bindgen.rust_defaults",
+    ],
+    rustlibs: [
+        "libopen_dice_cbor_bindgen_multialg",
+    ],
+    whole_static_libs: ["libopen_dice_android_multialg"],
+    min_sdk_version: "35",
 }
 
 rust_bindgen {
@@ -263,4 +338,10 @@ rust_test {
     auto_gen_config: true,
     clippy_lints: "none",
     lints: "none",
+}
+
+dirgroup {
+    name: "trusty_dirgroup_packages_modules_virtualization_libs_open_dice",
+    visibility: ["//trusty/vendor/google/aosp/scripts"],
+    dirs: ["."],
 }
